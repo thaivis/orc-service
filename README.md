@@ -164,6 +164,6 @@ curl -X POST http://localhost:8000/scan -H "X-API-Key: $(grep API_KEY .env | cut
   -F type=thai_id -F image=@.test-fixtures/fake7.jpg
 ```
 
-PaddleOCR + paddlepaddle รวม ~500MB ตอน install — แนะนำให้ใช้ docker เท่านั้น
+PaddleOCR + paddlepaddle รวม ~500MB ตอน install — แนะนำให้ใช้ docker เ ท่านั้น
 
 โครงสร้างโค้ด: ดู `PRD.md §9`
