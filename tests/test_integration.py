@@ -60,11 +60,11 @@ def _post_scan(client: TestClient, fixture: str, scan_type: str) -> tuple[int, d
     path = FIXTURES / fixture
     if not path.exists():
         pytest.skip(f"fixture missing: {fixture}")
+    endpoint = f"/scan/{scan_type.replace('_', '-')}"
     with open(path, "rb") as f:
         resp = client.post(
-            "/scan",
+            endpoint,
             headers={"X-API-Key": API_KEY},
-            data={"type": scan_type},
             files={"image": (fixture, f, _content_type(fixture))},
         )
     return resp.status_code, resp.json(), dict(resp.headers)
@@ -132,26 +132,6 @@ def test_thai_id_engine_extracts_at_least_one(client: TestClient):
     assert extracted, "no Thai ID fixture extracted — engine appears broken"
 
 
-# --- Type mismatch detection (Phase 6 gate) ---
-
-@needs_paddle
-def test_type_mismatch_thai_id_sent_as_passport(client: TestClient):
-    """Sending fake7.jpg (Thai ID) with type=passport → 422 + detected_type=thai_id."""
-    status, body, _ = _post_scan(client, "fake7.jpg", "passport")
-    assert status == 422, body
-    assert body["error"] == "type_mismatch"
-    assert body.get("detected_type") == "thai_id"
-
-
-@needs_paddle
-def test_type_mismatch_passport_sent_as_thai_id(client: TestClient):
-    """Sending fake1.jpg (passport) with type=thai_id → 422 + detected_type=passport."""
-    status, body, _ = _post_scan(client, "fake1.jpg", "thai_id")
-    assert status == 422, body
-    assert body["error"] == "type_mismatch"
-    assert body.get("detected_type") == "passport"
-
-
 # --- Edge cases / input validation ---
 
 def test_oversized_file_rejected(client: TestClient):
@@ -192,6 +172,6 @@ def test_request_id_header_returned_on_success(client: TestClient):
 def test_request_id_returned_even_on_auth_failure(client: TestClient):
     resp = client.get("/health")  # public, no PII
     assert resp.status_code == 200
-    resp2 = client.post("/scan", headers={"X-API-Key": "wrong"}, data={"type": "passport"})
+    resp2 = client.post("/scan/passport", headers={"X-API-Key": "wrong"})
     assert resp2.status_code == 401
     assert "x-request-id" in {k.lower() for k in resp2.headers}

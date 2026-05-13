@@ -2,7 +2,7 @@ import logging
 import time
 import uuid
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
@@ -10,7 +10,6 @@ from app.config import get_settings
 from app.logging_config import configure_logging, request_id_var
 from app.scan_error import ScanError
 from app.schemas import (
-    DocumentType,
     ErrorCode,
     ErrorResponse,
     ScanResponse,
@@ -192,17 +191,6 @@ def _handle_scan_result(
                 "error": err.code,
                 "message": "Image bytes could not be decoded",
             },
-        )
-    if err.code == ErrorCode.TYPE_MISMATCH.value:
-        detail: dict[str, object] = {
-            "error": err.code,
-            "message": f"Detected {err.detected_type.value if err.detected_type else 'different'} but type did not match",
-        }
-        if err.detected_type is not None:
-            detail["detected_type"] = err.detected_type.value
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=detail,
         )
     raise HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

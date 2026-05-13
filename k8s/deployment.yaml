@@ -1,0 +1,174 @@
+# ConfigMap: non-secret runtime config (mirrors .env.example)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orc-service-config
+data:
+  PORT: "8000"
+  MAX_IMAGE_SIZE_MB: "10"
+  MAX_IMAGE_DIMENSION: "2000"
+  LOG_LEVEL: "info"
+---
+# Secret: shared API key used by NestJS -> orc-service
+# Replace the value before applying:  echo -n 'your-real-key' | base64
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orc-service-secrets
+type: Opaque
+stringData:
+  API_KEY: "test-validation-key-phase1"
+---
+# Optional: pull secret if ghcr.io image is private.
+# Create with:
+#   kubectl -n orc-service create secret docker-registry ghcr-pull \
+#     --docker-server=ghcr.io \
+#     --docker-username=<github-user> \
+#     --docker-password=<github-PAT-with-read:packages> \
+#     --docker-email=<email>
+# Then keep `imagePullSecrets` in the Deployment below.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orc-service
+  labels:
+    app: orc-service
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: orc-service
+  template:
+    metadata:
+      labels:
+        app: orc-service
+    spec:
+      securityContext:
+        runAsNonRoot: false
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: orc-service
+          image: ghcr.io/sukhantharot/orc-service:sha-d5ccbdf
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: orc-service-config
+            - secretRef:
+                name: orc-service-secrets
+          resources:
+            # PaddleOCR + Tesseract are CPU-bound; bump if you see throttling.
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          # PaddleOCR downloads models on first /scan request.
+          # startupProbe gives the pod long enough to come up + warm models.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 60   # up to 5 minutes for cold start
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: paddle-cache
+              mountPath: /root/.paddlex
+            - name: paddleocr-cache
+              mountPath: /root/.paddleocr
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+        # Per-pod cache for PaddleOCR model downloads. Swap to a PVC if you
+        # want models to persist across pod restarts.
+        - name: paddle-cache
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: paddleocr-cache
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orc-service
+  labels:
+    app: orc-service
+spec:
+  type: ClusterIP
+  selector:
+    app: orc-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+# Optional: HorizontalPodAutoscaler. Requires metrics-server in the cluster.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: orc-service
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: orc-service
+  minReplicas: 1
+  maxReplicas: 2
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+# NetworkPolicy: อนุญาตเฉพาะ pods ใน namespace เดียวกัน (orc-service) เท่านั้น
+# ที่จะเรียกเข้ามาที่ orc-service ได้ — บล็อก ingress จากภายนอก namespace ทั้งหมด
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orc-service-allow-same-namespace
+spec:
+  podSelector:
+    matchLabels:
+      app: orc-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8000
