@@ -2,7 +2,7 @@ import logging
 import time
 import uuid
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
@@ -10,7 +10,6 @@ from app.config import get_settings
 from app.logging_config import configure_logging, request_id_var
 from app.scan_error import ScanError
 from app.schemas import (
-    DocumentType,
     ErrorCode,
     ErrorResponse,
     ScanResponse,
@@ -83,12 +82,6 @@ async def request_context_middleware(request: Request, call_next):
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     for err in exc.errors():
         loc = err.get("loc", ())
-        if "type" in loc:
-            return _error(
-                ErrorCode.INVALID_TYPE,
-                "Field 'type' must be one of: thai_id, passport",
-                status.HTTP_400_BAD_REQUEST,
-            )
         if "image" in loc:
             return _error(
                 ErrorCode.IMAGE_INVALID,
@@ -107,19 +100,8 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post(
-    "/scan",
-    response_model=ScanResponse,
-    responses={
-        400: {"model": ErrorResponse},
-        401: {"model": ErrorResponse},
-        422: {"model": ErrorResponse},
-    },
-)
-async def scan(
-    type: DocumentType = Form(...),
-    image: UploadFile = File(...),
-) -> ScanResponse:
+async def _validate_and_read_image(image: UploadFile) -> bytes:
+    """Validate and read image file."""
     settings = get_settings()
 
     if image.content_type not in ALLOWED_CONTENT_TYPES:
@@ -151,16 +133,47 @@ async def scan(
             },
         )
 
-    if type == DocumentType.PASSPORT:
-        from app.scanners.passport import scan_passport
+    return contents
 
-        result, err = scan_passport(contents)
-        return _handle_scan_result(result, err, "No MRZ detected in image")
+
+@app.post(
+    "/scan/thai-id",
+    response_model=ScanResponse,
+    responses={
+        400: {"model": ErrorResponse},
+        401: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+    },
+)
+async def scan_thai_id_card(
+    image: UploadFile = File(...),
+) -> ScanResponse:
+    contents = await _validate_and_read_image(image)
 
     from app.scanners.thai_id import scan_thai_id
 
     result, err = scan_thai_id(contents)
     return _handle_scan_result(result, err, "No Thai ID detected in image")
+
+
+@app.post(
+    "/scan/passport",
+    response_model=ScanResponse,
+    responses={
+        400: {"model": ErrorResponse},
+        401: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+    },
+)
+async def scan_passport_document(
+    image: UploadFile = File(...),
+) -> ScanResponse:
+    contents = await _validate_and_read_image(image)
+
+    from app.scanners.passport import scan_passport
+
+    result, err = scan_passport(contents)
+    return _handle_scan_result(result, err, "No MRZ detected in image")
 
 
 def _handle_scan_result(
@@ -178,17 +191,6 @@ def _handle_scan_result(
                 "error": err.code,
                 "message": "Image bytes could not be decoded",
             },
-        )
-    if err.code == ErrorCode.TYPE_MISMATCH.value:
-        detail: dict[str, object] = {
-            "error": err.code,
-            "message": f"Detected {err.detected_type.value if err.detected_type else 'different'} but type did not match",
-        }
-        if err.detected_type is not None:
-            detail["detected_type"] = err.detected_type.value
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=detail,
         )
     raise HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

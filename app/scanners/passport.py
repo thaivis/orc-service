@@ -86,18 +86,6 @@ def scan_passport(image_bytes: bytes) -> tuple[ScanResponse | None, ScanError | 
     if fallback is not None:
         return _to_response(fallback), None
 
-    # No MRZ found — try to detect whether the user sent a Thai ID by mistake.
-    # If the Thai-ID engine isn't available (paddle not installed), skip the check
-    # and report no_document_detected rather than 500-ing.
-    try:
-        from app.scanners.thai_id import looks_like_thai_id
-    except ImportError:
-        return None, ScanError("no_document_detected")
-    try:
-        if looks_like_thai_id(img):
-            return None, ScanError("type_mismatch", DocumentType.THAI_ID)
-    except (ImportError, ModuleNotFoundError):
-        pass
     return None, ScanError("no_document_detected")
 
 

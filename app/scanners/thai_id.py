@@ -298,13 +298,4 @@ def scan_thai_id(image_bytes: bytes) -> tuple[ScanResponse | None, ScanError | N
     if img is None:
         return None, ScanError("image_invalid")
     lines = _run_ocr(img)
-    result, err = scan_thai_id_from_lines(lines)
-    if err is not None and err.code == "no_document_detected":
-        try:
-            from app.scanners.passport import looks_like_passport
-
-            if looks_like_passport(img):
-                return None, ScanError("type_mismatch", DocumentType.PASSPORT)
-        except (ImportError, ModuleNotFoundError):
-            pass
-    return result, err
+    return scan_thai_id_from_lines(lines)
