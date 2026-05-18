@@ -5,7 +5,7 @@ from datetime import date
 
 import numpy as np
 
-from app.preprocessing import preprocess
+from app.preprocessing import preprocess, rotations
 from app.scan_error import ScanError
 from app.schemas import ConfidenceScores, DocumentType, ScanResponse, Sex
 from app.validators import thai_id_checksum
@@ -297,5 +297,9 @@ def scan_thai_id(image_bytes: bytes) -> tuple[ScanResponse | None, ScanError | N
     img = preprocess(image_bytes)
     if img is None:
         return None, ScanError("image_invalid")
-    lines = _run_ocr(img)
-    return scan_thai_id_from_lines(lines)
+    for _deg, rotated in rotations(img):
+        lines = _run_ocr(rotated)
+        result, err = scan_thai_id_from_lines(lines)
+        if result is not None:
+            return result, None
+    return None, ScanError("no_document_detected")

@@ -1,6 +1,7 @@
 services:
   orc-service:
     build: .
+    platform: linux/amd64
     container_name: orc-service
     ports:
       - "${PORT:-8000}:8000"

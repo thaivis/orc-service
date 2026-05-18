@@ -170,6 +170,14 @@ async def scan_passport_document(
 ) -> ScanResponse:
     contents = await _validate_and_read_image(image)
 
+    # DEBUG: save incoming image to disk
+    import os
+    os.makedirs("/tmp/orc-debug", exist_ok=True)
+    debug_path = f"/tmp/orc-debug/passport_{uuid.uuid4().hex[:8]}.jpg"
+    with open(debug_path, "wb") as f:
+        f.write(contents)
+    logger.info("debug_image_saved", extra={"path": debug_path, "method": "GET", "path": "/debug", "status": 200, "duration_ms": 0})
+
     from app.scanners.passport import scan_passport
 
     result, err = scan_passport(contents)
