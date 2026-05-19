@@ -33,6 +33,7 @@ class ScanResponse(BaseModel):
     sex: Sex | None = None
     country: str | None = None
     document_valid: bool = False
+    image_url: str | None = None
     confidence: ConfidenceScores
     warnings: list[str] = Field(default_factory=list)
 

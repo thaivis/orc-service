@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     max_image_dimension: int = 2000
     log_level: str = "info"
 
+    minio_endpoint: str | None = None
+    minio_access_key: str | None = None
+    minio_secret_key: str | None = None
+    minio_bucket: str = "thaivis-id-documents"
+    minio_use_ssl: bool = False
+
 
 @lru_cache
 def get_settings() -> Settings:
