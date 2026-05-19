@@ -20,6 +20,8 @@ class Settings(BaseSettings):
 
     encryption_key: str | None = None
 
+    hotel_name: str = "Hotel"
+
 
 @lru_cache
 def get_settings() -> Settings:
