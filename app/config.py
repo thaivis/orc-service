@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     encryption_key: str | None = None
 
     hotel_name: str = "Hotel"
+    public_base_url: str = ""
 
 
 @lru_cache

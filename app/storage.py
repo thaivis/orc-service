@@ -1,6 +1,7 @@
 import io
 import logging
 import uuid
+from datetime import date as _date
 from datetime import datetime, timezone
 
 from PIL import Image
@@ -11,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 def upload_document_image(image_bytes: bytes, document_type: str) -> str | None:
-    """Upload document image to MinIO/S3, returning the object URL or None if disabled/failed."""
+    """Upload document image to MinIO/S3. Returns object_key or None if disabled/failed."""
     settings = get_settings()
 
     if not settings.minio_endpoint:
@@ -26,6 +27,13 @@ def upload_document_image(image_bytes: bytes, document_type: str) -> str | None:
     except Exception:
         logger.warning("storage: WebP conversion failed", exc_info=True)
         return None
+
+    # Watermark then encrypt — exceptions propagate; never store plaintext
+    from app.encryption import encrypt
+    from app.watermark import apply_watermark
+
+    watermarked = apply_watermark(webp_bytes, settings.hotel_name, _date.today().isoformat())
+    payload = encrypt(watermarked)
 
     # Object key: {document_type}/{year}/{month}/{uuid}.webp
     now = datetime.now(tz=timezone.utc)
@@ -46,11 +54,11 @@ def upload_document_image(image_bytes: bytes, document_type: str) -> str | None:
         client.put_object(
             Bucket=settings.minio_bucket,
             Key=object_key,
-            Body=webp_bytes,
+            Body=payload,
             ContentType="image/webp",
         )
     except Exception:
         logger.warning("storage: MinIO upload failed", exc_info=True)
         return None
 
-    return f"{endpoint_url}/{settings.minio_bucket}/{object_key}"
+    return object_key

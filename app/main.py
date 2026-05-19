@@ -157,7 +157,10 @@ async def scan_thai_id_card(
         try:
             from app.storage import upload_document_image
 
-            result.image_url = upload_document_image(contents, "thai-id")
+            object_key = upload_document_image(contents, "thai-id")
+            if object_key is not None:
+                base = get_settings().public_base_url.rstrip("/")
+                result.image_url = f"{base}/document/{object_key}" if base else f"/document/{object_key}"
         except Exception:
             logger.error("storage: unexpected error during upload", exc_info=True)
     return _handle_scan_result(result, err, "No Thai ID detected in image")
@@ -184,7 +187,10 @@ async def scan_passport_document(
         try:
             from app.storage import upload_document_image
 
-            result.image_url = upload_document_image(contents, "passport")
+            object_key = upload_document_image(contents, "passport")
+            if object_key is not None:
+                base = get_settings().public_base_url.rstrip("/")
+                result.image_url = f"{base}/document/{object_key}" if base else f"/document/{object_key}"
         except Exception:
             logger.error("storage: unexpected error during upload", exc_info=True)
     return _handle_scan_result(result, err, "No MRZ detected in image")
@@ -213,6 +219,48 @@ def _handle_scan_result(
             "message": not_detected_message,
         },
     )
+
+
+@app.get(
+    "/document/{object_key:path}",
+    responses={401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+)
+async def get_document(object_key: str) -> Response:
+    settings = get_settings()
+
+    if not settings.minio_endpoint:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "not_found", "message": "Object not found"},
+        )
+
+    scheme = "https" if settings.minio_use_ssl else "http"
+    endpoint_url = f"{scheme}://{settings.minio_endpoint}"
+
+    import boto3
+    from botocore.exceptions import ClientError
+
+    from app.encryption import decrypt
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=settings.minio_access_key,
+        aws_secret_access_key=settings.minio_secret_key,
+    )
+    try:
+        s3_response = client.get_object(Bucket=settings.minio_bucket, Key=object_key)
+        encrypted_blob = s3_response["Body"].read()
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "not_found", "message": "Object not found"},
+            )
+        raise
+
+    plaintext = decrypt(encrypted_blob)
+    return Response(content=plaintext, media_type="image/webp")
 
 
 @app.exception_handler(HTTPException)
