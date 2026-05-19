@@ -3,6 +3,7 @@ import shutil
 import sys
 
 os.environ.setdefault("API_KEY", "test-key")
+os.environ.setdefault("ENCRYPTION_KEY", "a" * 64)
 
 # Help fastmrz/pytesseract find the Tesseract binary on Windows where it's not on PATH by default
 if sys.platform == "win32" and not shutil.which("tesseract"):

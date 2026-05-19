@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     minio_bucket: str = "thaivis-id-documents"
     minio_use_ssl: bool = False
 
+    encryption_key: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:
