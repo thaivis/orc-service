@@ -153,6 +153,13 @@ async def scan_thai_id_card(
     from app.scanners.thai_id import scan_thai_id
 
     result, err = scan_thai_id(contents)
+    if result is not None:
+        try:
+            from app.storage import upload_document_image
+
+            result.image_url = upload_document_image(contents, "thai-id")
+        except Exception:
+            logger.error("storage: unexpected error during upload", exc_info=True)
     return _handle_scan_result(result, err, "No Thai ID detected in image")
 
 
@@ -173,6 +180,13 @@ async def scan_passport_document(
     from app.scanners.passport import scan_passport
 
     result, err = scan_passport(contents)
+    if result is not None:
+        try:
+            from app.storage import upload_document_image
+
+            result.image_url = upload_document_image(contents, "passport")
+        except Exception:
+            logger.error("storage: unexpected error during upload", exc_info=True)
     return _handle_scan_result(result, err, "No MRZ detected in image")
 
 
