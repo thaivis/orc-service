@@ -13,3 +13,5 @@ venv/
 *.log
 .test-fixtures/
 .claude/
+prds/
+plans/
