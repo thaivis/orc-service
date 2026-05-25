@@ -20,6 +20,23 @@ logger = logging.getLogger("orc-service")
 
 app = FastAPI(title="orc-service", version="0.1.0")
 
+
+@app.on_event("startup")
+async def _warm_models() -> None:
+    """Pre-load PaddleOCR model at startup so the first real scan isn't slow."""
+    import asyncio
+    import threading
+
+    def _load():
+        try:
+            from app.scanners.thai_id import _get_ocr
+            _get_ocr()
+            logger.info("PaddleOCR model warm-up complete")
+        except Exception:
+            logger.warning("PaddleOCR warm-up failed (non-fatal)", exc_info=True)
+
+    threading.Thread(target=_load, daemon=True).start()
+
 PUBLIC_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
 
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png"}

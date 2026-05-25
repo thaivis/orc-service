@@ -1,7 +1,5 @@
 """AES-256-GCM encryption primitives for storing ID document images."""
 
-import os
-
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 
@@ -11,8 +9,9 @@ _TAG_LEN = 16
 _MIN_BLOB_LEN = len(MAGIC) + _IV_LEN + _TAG_LEN
 
 
-def _load_key_from_env() -> bytes:
-    hex_key = os.environ.get("ENCRYPTION_KEY", "")
+def _load_key() -> bytes:
+    from app.config import get_settings
+    hex_key = get_settings().encryption_key or ""
     if len(hex_key) != 64:
         raise ValueError(
             f"ENCRYPTION_KEY must be exactly 64 hex characters (32 bytes); got {len(hex_key)}"
@@ -23,7 +22,7 @@ def _load_key_from_env() -> bytes:
         raise ValueError("ENCRYPTION_KEY contains non-hex characters")
 
 
-_key: bytes = _load_key_from_env()
+_key: bytes = _load_key()
 
 
 def encrypt(plaintext: bytes) -> bytes:
