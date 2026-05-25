@@ -102,6 +102,7 @@ def test_thai_id_image_url_populated_when_storage_returns_key(client: TestClient
     with (
         patch("app.scanners.thai_id.scan_thai_id", return_value=_fake_scan_result(DocumentType.THAI_ID)),
         patch("app.storage.upload_document_image", return_value=object_key),
+        patch("app.main.get_settings", return_value=_settings_with_minio()),
     ):
         status, body = _post(client, "/scan/thai-id", jpeg)
     assert status == 200
@@ -114,6 +115,7 @@ def test_passport_image_url_populated_when_storage_returns_key(client: TestClien
     with (
         patch("app.scanners.passport.scan_passport", return_value=_fake_scan_result(DocumentType.PASSPORT)),
         patch("app.storage.upload_document_image", return_value=object_key),
+        patch("app.main.get_settings", return_value=_settings_with_minio()),
     ):
         status, body = _post(client, "/scan/passport", jpeg)
     assert status == 200
@@ -162,6 +164,106 @@ def test_passport_scan_succeeds_even_when_storage_raises(client: TestClient):
         status, body = _post(client, "/scan/passport", jpeg)
     assert status == 200
     assert body["image_url"] is None
+
+
+# ---------------------------------------------------------------------------
+# warnings contains "storage_upload_failed" when MinIO configured but upload fails
+# ---------------------------------------------------------------------------
+
+def test_thai_id_warning_when_minio_configured_and_upload_returns_none(client: TestClient):
+    jpeg = _make_jpeg_bytes()
+    settings = _settings_with_minio()
+    with (
+        patch("app.scanners.thai_id.scan_thai_id", return_value=_fake_scan_result(DocumentType.THAI_ID)),
+        patch("app.storage.upload_document_image", return_value=None),
+        patch("app.main.get_settings", return_value=settings),
+    ):
+        status, body = _post(client, "/scan/thai-id", jpeg)
+    assert status == 200
+    assert body["image_url"] is None
+    assert "storage_upload_failed" in body["warnings"]
+
+
+def test_passport_warning_when_minio_configured_and_upload_returns_none(client: TestClient):
+    jpeg = _make_jpeg_bytes()
+    settings = _settings_with_minio()
+    with (
+        patch("app.scanners.passport.scan_passport", return_value=_fake_scan_result(DocumentType.PASSPORT)),
+        patch("app.storage.upload_document_image", return_value=None),
+        patch("app.main.get_settings", return_value=settings),
+    ):
+        status, body = _post(client, "/scan/passport", jpeg)
+    assert status == 200
+    assert body["image_url"] is None
+    assert "storage_upload_failed" in body["warnings"]
+
+
+def test_thai_id_warning_when_minio_configured_and_upload_raises(client: TestClient):
+    jpeg = _make_jpeg_bytes()
+    settings = _settings_with_minio()
+    with (
+        patch("app.scanners.thai_id.scan_thai_id", return_value=_fake_scan_result(DocumentType.THAI_ID)),
+        patch("app.storage.upload_document_image", side_effect=RuntimeError("boom")),
+        patch("app.main.get_settings", return_value=settings),
+    ):
+        status, body = _post(client, "/scan/thai-id", jpeg)
+    assert status == 200
+    assert body["image_url"] is None
+    assert "storage_upload_failed" in body["warnings"]
+
+
+def test_passport_warning_when_minio_configured_and_upload_raises(client: TestClient):
+    jpeg = _make_jpeg_bytes()
+    settings = _settings_with_minio()
+    with (
+        patch("app.scanners.passport.scan_passport", return_value=_fake_scan_result(DocumentType.PASSPORT)),
+        patch("app.storage.upload_document_image", side_effect=RuntimeError("boom")),
+        patch("app.main.get_settings", return_value=settings),
+    ):
+        status, body = _post(client, "/scan/passport", jpeg)
+    assert status == 200
+    assert body["image_url"] is None
+    assert "storage_upload_failed" in body["warnings"]
+
+
+def test_thai_id_no_warning_when_minio_not_configured(client: TestClient):
+    jpeg = _make_jpeg_bytes()
+    with patch("app.scanners.thai_id.scan_thai_id", return_value=_fake_scan_result(DocumentType.THAI_ID)):
+        status, body = _post(client, "/scan/thai-id", jpeg)
+    assert status == 200
+    assert "storage_upload_failed" not in body["warnings"]
+
+
+def test_passport_no_warning_when_minio_not_configured(client: TestClient):
+    jpeg = _make_jpeg_bytes()
+    with patch("app.scanners.passport.scan_passport", return_value=_fake_scan_result(DocumentType.PASSPORT)):
+        status, body = _post(client, "/scan/passport", jpeg)
+    assert status == 200
+    assert "storage_upload_failed" not in body["warnings"]
+
+
+def test_thai_id_no_warning_when_upload_succeeds(client: TestClient):
+    jpeg = _make_jpeg_bytes()
+    object_key = "thai-id/2026/05/some-uuid.webp"
+    with (
+        patch("app.scanners.thai_id.scan_thai_id", return_value=_fake_scan_result(DocumentType.THAI_ID)),
+        patch("app.storage.upload_document_image", return_value=object_key),
+    ):
+        status, body = _post(client, "/scan/thai-id", jpeg)
+    assert status == 200
+    assert "storage_upload_failed" not in body["warnings"]
+
+
+def test_passport_no_warning_when_upload_succeeds(client: TestClient):
+    jpeg = _make_jpeg_bytes()
+    object_key = "passport/2026/05/some-uuid.webp"
+    with (
+        patch("app.scanners.passport.scan_passport", return_value=_fake_scan_result(DocumentType.PASSPORT)),
+        patch("app.storage.upload_document_image", return_value=object_key),
+    ):
+        status, body = _post(client, "/scan/passport", jpeg)
+    assert status == 200
+    assert "storage_upload_failed" not in body["warnings"]
 
 
 # ---------------------------------------------------------------------------

@@ -154,15 +154,20 @@ async def scan_thai_id_card(
 
     result, err = scan_thai_id(contents)
     if result is not None:
-        try:
-            from app.storage import upload_document_image
+        settings = get_settings()
+        if settings.minio_endpoint:
+            try:
+                from app.storage import upload_document_image
 
-            object_key = upload_document_image(contents, "thai-id")
-            if object_key is not None:
-                base = get_settings().public_base_url.rstrip("/")
-                result.image_url = f"{base}/document/{object_key}" if base else f"/document/{object_key}"
-        except Exception:
-            logger.error("storage: unexpected error during upload", exc_info=True)
+                object_key = upload_document_image(contents, "thai-id")
+                if object_key is not None:
+                    base = settings.public_base_url.rstrip("/")
+                    result.image_url = f"{base}/document/{object_key}" if base else f"/document/{object_key}"
+                else:
+                    result.warnings.append("storage_upload_failed")
+            except Exception:
+                logger.error("storage: unexpected error during upload", exc_info=True)
+                result.warnings.append("storage_upload_failed")
     return _handle_scan_result(result, err, "No Thai ID detected in image")
 
 
@@ -184,15 +189,20 @@ async def scan_passport_document(
 
     result, err = scan_passport(contents)
     if result is not None:
-        try:
-            from app.storage import upload_document_image
+        settings = get_settings()
+        if settings.minio_endpoint:
+            try:
+                from app.storage import upload_document_image
 
-            object_key = upload_document_image(contents, "passport")
-            if object_key is not None:
-                base = get_settings().public_base_url.rstrip("/")
-                result.image_url = f"{base}/document/{object_key}" if base else f"/document/{object_key}"
-        except Exception:
-            logger.error("storage: unexpected error during upload", exc_info=True)
+                object_key = upload_document_image(contents, "passport")
+                if object_key is not None:
+                    base = settings.public_base_url.rstrip("/")
+                    result.image_url = f"{base}/document/{object_key}" if base else f"/document/{object_key}"
+                else:
+                    result.warnings.append("storage_upload_failed")
+            except Exception:
+                logger.error("storage: unexpected error during upload", exc_info=True)
+                result.warnings.append("storage_upload_failed")
     return _handle_scan_result(result, err, "No MRZ detected in image")
 
 
