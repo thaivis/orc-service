@@ -134,7 +134,13 @@
       "Bash(pnpm -F backend test:unit)",
       "Bash(pnpm -F web test)",
       "Bash(pnpm -F web-andalay test)",
-      "Bash(pnpm -F backend test:integration)"
+      "Bash(pnpm -F backend test:integration)",
+      "Bash(python3 -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\")",
+      "Bash(ENCRYPTION_KEY=$\\(python3 -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\"\\) pytest tests/test_encryption.py -v --tb=short)",
+      "Bash(ENCRYPTION_KEY=$\\(python3 -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\"\\) API_KEY=test-key python3 -m pytest tests/test_encryption.py -v --tb=short)",
+      "Bash(python3.11 -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\")",
+      "Bash(ENCRYPTION_KEY=$\\(python3.11 -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\"\\) API_KEY=test-key python3.11 -m pytest tests/test_encryption.py -v --tb=short)",
+      "Bash(ENCRYPTION_KEY=$\\(python3 -c \"import secrets; print\\(secrets.token_hex\\(32\\)\\)\"\\) API_KEY=test-key .venv/bin/pytest tests/test_encryption.py -v --tb=short)"
     ]
   }
 }
