@@ -3,14 +3,18 @@
 No MinIO, PaddleOCR, or Tesseract dependency is required to run these tests.
 """
 
-import os
-
 import pytest
 
 import app.encryption as enc
-from app.encryption import MAGIC, _load_key_from_env, decrypt, encrypt
+from app.encryption import MAGIC, _load_key, decrypt, encrypt
 
 VALID_KEY = "a" * 64  # 32 bytes of 0xAA
+
+
+class _MockSettings:
+    """Minimal settings stub for key-loading tests."""
+    def __init__(self, encryption_key=None):
+        self.encryption_key = encryption_key
 
 
 # ---------------------------------------------------------------------------
@@ -103,25 +107,25 @@ def test_decrypt_too_short_raises():
 
 
 def test_load_key_missing_raises(monkeypatch):
-    monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
+    monkeypatch.setattr("app.config.get_settings", lambda: _MockSettings(encryption_key=None))
     with pytest.raises(ValueError, match="64 hex"):
-        _load_key_from_env()
+        _load_key()
 
 
 def test_load_key_too_short_raises(monkeypatch):
-    monkeypatch.setenv("ENCRYPTION_KEY", "abc123")
+    monkeypatch.setattr("app.config.get_settings", lambda: _MockSettings(encryption_key="abc123"))
     with pytest.raises(ValueError, match="64 hex"):
-        _load_key_from_env()
+        _load_key()
 
 
 def test_load_key_non_hex_raises(monkeypatch):
-    monkeypatch.setenv("ENCRYPTION_KEY", "z" * 64)
+    monkeypatch.setattr("app.config.get_settings", lambda: _MockSettings(encryption_key="z" * 64))
     with pytest.raises(ValueError, match="non-hex"):
-        _load_key_from_env()
+        _load_key()
 
 
 def test_load_key_valid_returns_32_bytes(monkeypatch):
-    monkeypatch.setenv("ENCRYPTION_KEY", VALID_KEY)
-    key = _load_key_from_env()
+    monkeypatch.setattr("app.config.get_settings", lambda: _MockSettings(encryption_key=VALID_KEY))
+    key = _load_key()
     assert isinstance(key, bytes)
     assert len(key) == 32
