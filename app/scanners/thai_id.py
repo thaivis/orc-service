@@ -70,8 +70,13 @@ def _find_below(anchor: OcrLine, lines: list[OcrLine], max_dx: float = 100.0) ->
 # --- ID number ---
 
 def extract_id_number(lines: list[OcrLine]) -> tuple[str | None, float, bool]:
-    """Returns (id_str_13_digits, confidence, checksum_valid). Prefers checksum-valid match."""
+    """Returns (id_str_13_digits, confidence, checksum_valid). Prefers checksum-valid match.
+
+    Handles two OCR shapes: a single line holding the whole number, and a number that
+    PaddleOCR split across several detections (e.g. '1' '8399' '01779' '295') — common on
+    sharp, straight scans where each digit group becomes its own text box."""
     fallback: tuple[str, float] | None = None
+    # Fast path: one line already contains all 13 digits.
     for line in lines:
         digits = re.sub(r"\D", "", line.text)
         if len(digits) == 13:
@@ -79,6 +84,23 @@ def extract_id_number(lines: list[OcrLine]) -> tuple[str | None, float, bool]:
                 return digits, line.confidence, True
             if fallback is None:
                 fallback = (digits, line.confidence)
+    # Fragmented path: concatenate consecutive digit runs and accept the first checksum-valid
+    # 13-digit window. The checksum gates against false joins (dates, card/laser numbers).
+    runs: list[tuple[str, float]] = [
+        (m.group(), line.confidence)
+        for line in lines
+        for m in re.finditer(r"\d+", line.text)
+    ]
+    for i in range(len(runs)):
+        joined = ""
+        confs: list[float] = []
+        for digits, conf in runs[i:]:
+            joined += digits
+            confs.append(conf)
+            if len(joined) >= 13:
+                if len(joined) == 13 and thai_id_checksum(joined):
+                    return joined, sum(confs) / len(confs), True
+                break
     if fallback is not None:
         return fallback[0], fallback[1], False
     return None, 0.0, False
@@ -90,15 +112,24 @@ THAI_TITLE_TO_SEX: dict[str, str] = {
     "เด็กชาย": "M",
     "เด็กหญิง": "F",
     "นางสาว": "F",  # check before "นาง" since it's a longer prefix containing "นาง"
+    "น.ส.": "F",
     "นาย": "M",
     "นาง": "F",
 }
+
+EN_TITLE_TO_SEX = {"mr": "M", "mister": "M", "master": "M", "mrs": "F", "miss": "F"}
+
 
 def extract_sex(lines: list[OcrLine]) -> tuple[Sex | None, float]:
     for line in lines:
         for prefix, s in THAI_TITLE_TO_SEX.items():
             if prefix in line.text:
                 return Sex(s), line.confidence
+    # English title fallback — some cards OCR the Thai title poorly (e.g. 'น.ส.' → 'Miss')
+    for line in lines:
+        m = re.search(r"\b(mr|mrs|miss|master|mister)\b", line.text, re.IGNORECASE)
+        if m:
+            return Sex(EN_TITLE_TO_SEX[m.group(1).lower()]), line.confidence
     return None, 0.0
 
 
@@ -122,41 +153,92 @@ def _first_alpha_token(text: str) -> str | None:
     return None
 
 
+NAME_STOPWORDS = {"MR", "MRS", "MISS", "MASTER", "MISTER", "LAST", "NAME", "LASTNAME"}
+
+
+GLUED_TITLE_RE = re.compile(r"^(?:mr|mrs|miss|master|mister)\.?", re.IGNORECASE)
+
+
+def _name_token(text: str) -> str | None:
+    """First A-Za-z token in `text`, upper-cased, skipping titles and label words.
+
+    Also peels a title glued to the name when OCR drops the space ("Mr.Channarong")."""
+    for tok in _strip_title(text).split():
+        cleaned = re.sub(r"[^A-Za-z\-]", "", tok)
+        deglued = GLUED_TITLE_RE.sub("", cleaned)
+        if len(deglued) >= 2:  # only peel when a real name remains
+            cleaned = deglued
+        cleaned = cleaned.upper()
+        if cleaned and cleaned not in NAME_STOPWORDS:
+            return cleaned
+    return None
+
+
+def _row_tol(lines: list[OcrLine]) -> float:
+    """Vertical tolerance for 'same row', scaled to the image so it holds at any resolution."""
+    cys = [ln.cy for ln in lines]
+    if not cys:
+        return 8.0
+    return max(8.0, (max(cys) - min(cys)) * 0.02)
+
+
+def _same_row_right(anchor: OcrLine, lines: list[OcrLine], tol: float) -> list[OcrLine]:
+    """Lines on the same text row as `anchor`, to its right, ordered left-to-right.
+
+    PaddleOCR often emits a field's label and value as separate boxes with the value to the
+    right; searching 'below' misses those, so we scan rightward on the row first."""
+    same = [
+        ln for ln in lines
+        if ln is not anchor and abs(ln.cy - anchor.cy) <= tol and ln.cx > anchor.cx
+    ]
+    return sorted(same, key=lambda ln: ln.cx)
+
+
+def _name_candidates(anchor: OcrLine, lines: list[OcrLine], tol: float) -> list[OcrLine]:
+    """Value boxes to try for a label: same-row-right first, then the line below."""
+    cands = _same_row_right(anchor, lines, tol)
+    below = _find_below(anchor, lines)
+    if below is not None:
+        cands.append(below)
+    return cands
+
+
 def extract_first_name(lines: list[OcrLine]) -> tuple[str | None, float]:
-    # Strategy A: explicit English title prefix anywhere
+    # Strategy A: explicit English title prefix inline ("Mr. KITTIKHUN")
     for line in lines:
         m = EN_TITLE_RE.search(line.text)
         if m:
             return m.group(1).upper(), line.confidence
-    # Strategy B: anchor on "Name" label (excluding "Last Name")
+    # Strategy B: anchor on the "Name" label (excluding "Last Name"); value may be inline,
+    # to the right on the same row, or on the line below.
+    tol = _row_tol(lines)
     for line in lines:
         low = line.text.lower()
         if "name" in low and "last" not in low:
             after = re.sub(r"^.*?name\s*[:\-]?\s*", "", line.text, count=1, flags=re.IGNORECASE)
-            tok = _first_alpha_token(after)
+            tok = _name_token(after)
             if tok:
                 return tok, line.confidence
-            below = _find_below(line, lines)
-            if below:
-                tok = _first_alpha_token(_strip_title(below.text))
+            for cand in _name_candidates(line, lines, tol):
+                tok = _name_token(cand.text)
                 if tok:
-                    return tok, below.confidence
+                    return tok, cand.confidence
     return None, 0.0
 
 
 def extract_last_name(lines: list[OcrLine]) -> tuple[str | None, float]:
+    tol = _row_tol(lines)
     for line in lines:
         low = line.text.lower()
-        if "last name" in low or "lastname" in low or "last  name" in low:
-            after = re.sub(r"^.*?last\s*name\s*[:\-]?\s*", "", line.text, count=1, flags=re.IGNORECASE)
-            tok = _first_alpha_token(after)
+        if re.search(r"last\s*nam", low):  # tolerate OCR dropping the trailing 'e' ("Last nam")
+            after = re.sub(r"^.*?last\s*nam(?:e)?\s*[:\-]?\s*", "", line.text, count=1, flags=re.IGNORECASE)
+            tok = _name_token(after)
             if tok:
                 return tok, line.confidence
-            below = _find_below(line, lines)
-            if below:
-                tok = _first_alpha_token(below.text)
+            for cand in _name_candidates(line, lines, tol):
+                tok = _name_token(cand.text)
                 if tok:
-                    return tok, below.confidence
+                    return tok, cand.confidence
     return None, 0.0
 
 
@@ -210,20 +292,31 @@ def _parse_thai_date(text: str) -> date | None:
     return _try_make_date(year, month, day)
 
 
+def _parse_en_date(text: str) -> date | None:
+    m = DATE_EN_RE.search(text)
+    if not m:
+        return None
+    month = EN_MONTHS.get(m.group(2)[:3].lower())
+    if month is None:
+        return None
+    return _try_make_date(_be_to_ce(int(m.group(3))), month, int(m.group(1)))
+
+
 def extract_dob(lines: list[OcrLine]) -> tuple[date | None, float]:
-    # English date first (more reliable on Thai ID)
+    tol = _row_tol(lines)
+    # Anchored: reconstruct the date from the "Date of Birth" / "เกิด" row. This both avoids
+    # grabbing the issue/expiry date and stitches a date PaddleOCR split into separate tokens.
     for line in lines:
-        m = DATE_EN_RE.search(line.text)
-        if m:
-            month = EN_MONTHS.get(m.group(2)[:3].lower())
-            if month is None:
-                continue
-            day = int(m.group(1))
-            year = _be_to_ce(int(m.group(3)))
-            d = _try_make_date(year, month, day)
+        if "birth" in line.text.lower() or "เกิด" in line.text:
+            row_text = " ".join([line.text] + [c.text for c in _same_row_right(line, lines, tol)])
+            d = _parse_en_date(row_text) or _parse_thai_date(row_text)
             if d:
                 return d, line.confidence
-    # Thai date fallback
+    # Fallback: first parseable date anywhere (English preferred, then Thai).
+    for line in lines:
+        d = _parse_en_date(line.text)
+        if d:
+            return d, line.confidence
     for line in lines:
         d = _parse_thai_date(line.text)
         if d:
@@ -249,23 +342,36 @@ def looks_like_thai_id(img: np.ndarray) -> bool:
     return False
 
 
+def _has_id_card_markers(lines: list[OcrLine]) -> bool:
+    """True when the lines carry unmistakable Thai-ID header text, even if the number itself
+    didn't OCR. Lets low-res cards still return the fields that *were* read instead of a bare 422."""
+    for line in lines:
+        if "บัตรประจำตัวประชาชน" in line.text or "thai national id" in line.text.lower():
+            return True
+    return False
+
+
 def scan_thai_id_from_lines(lines: list[OcrLine]) -> tuple[ScanResponse | None, ScanError | None]:
     """Build ScanResponse from already-OCR'd lines. Pure function — used directly by tests."""
     id_num, id_conf, id_valid = extract_id_number(lines)
-    if id_num is None:
-        return None, ScanError("no_document_detected")
-
     first, first_conf = extract_first_name(lines)
     last, last_conf = extract_last_name(lines)
     dob, dob_conf = extract_dob(lines)
     sex, sex_conf = extract_sex(lines)
+
+    # No ID number: only accept the card if it clearly *is* a Thai ID (header present) AND we
+    # recovered at least one other field — otherwise it's genuinely not a readable document.
+    if id_num is None and not (_has_id_card_markers(lines) and any([first, last, dob, sex])):
+        return None, ScanError("no_document_detected")
 
     field_confs = [id_conf, first_conf, last_conf, dob_conf, sex_conf]
     populated = [c for c in field_confs if c > 0]
     overall = sum(populated) / len(populated) if populated else 0.0
 
     warnings: list[str] = []
-    if not id_valid:
+    if id_num is None:
+        warnings.append("id_number_unreadable")
+    elif not id_valid:
         warnings.append("thai_id_checksum_failed")
 
     return (
