@@ -20,10 +20,14 @@ RUN apt-get update \
 # fastmrz needs the custom MRZ-trained Tesseract model from tesseractMRZ.
 # Resolve tessdata dir from the installed eng.traineddata so this survives
 # Debian/tesseract version bumps.
+# -f makes curl FAIL on HTTP errors (e.g. GitHub 429) instead of writing the error page to the
+# file; --retry rides out transient rate-limits; the >1MB size gate rejects any junk that slips
+# through (the real model is ~11MB — a 199-byte "429 Too Many Requests" page must not pass).
 RUN TESSDATA_DIR="$(dirname "$(find /usr/share -name eng.traineddata | head -n1)")" \
-    && curl -sSL -o "${TESSDATA_DIR}/mrz.traineddata" \
+    && curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+        -o "${TESSDATA_DIR}/mrz.traineddata" \
         https://github.com/DoubangoTelecom/tesseractMRZ/raw/master/tessdata_best/mrz.traineddata \
-    && test -s "${TESSDATA_DIR}/mrz.traineddata"
+    && [ "$(wc -c < "${TESSDATA_DIR}/mrz.traineddata")" -gt 1000000 ]
 
 COPY requirements.txt .
 # paddlex[ocr] brings opencv-contrib-python==4.10.0.84 and checks for that exact package name at runtime
