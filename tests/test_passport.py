@@ -152,6 +152,7 @@ def test_scan_passport_rejects_low_score_fallback_and_salvages_line1(monkeypatch
     through to the line1-only salvage pass."""
     monkeypatch.setattr(passport_module, "preprocess", lambda b: "IMG")
     monkeypatch.setattr(passport_module, "decode_image", lambda b: "RAW")
+    monkeypatch.setattr(passport_module, "normalize_size", lambda r: r)
     monkeypatch.setattr(passport_module, "_get_detector", lambda: None)
     monkeypatch.setattr(passport_module, "rotations", lambda src: [(0, src)])
     monkeypatch.setattr(
@@ -285,6 +286,7 @@ def test_to_response_does_not_apply_floor_when_document_not_fully_valid():
 def test_scan_passport_accepts_fallback_at_min_score(monkeypatch):
     monkeypatch.setattr(passport_module, "preprocess", lambda b: "IMG")
     monkeypatch.setattr(passport_module, "decode_image", lambda b: "RAW")
+    monkeypatch.setattr(passport_module, "normalize_size", lambda r: r)
     monkeypatch.setattr(passport_module, "_get_detector", lambda: None)
     monkeypatch.setattr(passport_module, "rotations", lambda src: [(0, src)])
     monkeypatch.setattr(

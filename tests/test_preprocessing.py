@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -10,6 +12,8 @@ from app.preprocessing import (
     perspective_correct,
     rotations,
 )
+
+FIXTURES = Path(__file__).parent.parent / ".test-fixtures"
 
 
 def _encode_png(img: np.ndarray) -> bytes:
@@ -27,6 +31,17 @@ def test_decode_image_returns_array_for_valid_png():
 
 def test_decode_image_returns_none_for_garbage():
     assert decode_image(b"this is not an image") is None
+
+
+def test_decode_image_applies_exif_orientation():
+    """IMG_2730.jpg is a real iPhone 12 photo with EXIF orientation=6 (raw pixels are
+    landscape 4032x3024; correctly displayed it's portrait 3024x4032). Without
+    exif_transpose, decode_image would return the raw sideways array."""
+    raw = (FIXTURES / "IMG_2730.jpg").read_bytes()
+    out = decode_image(raw)
+    assert out is not None
+    h, w = out.shape[:2]
+    assert (h, w) == (4032, 3024)
 
 
 def test_normalize_size_no_upscale():
