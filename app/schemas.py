@@ -17,6 +17,7 @@ class Sex(str, Enum):
 class ConfidenceScores(BaseModel):
     overall: float = Field(ge=0.0, le=1.0)
     first_name: float = Field(ge=0.0, le=1.0, default=0.0)
+    middle_name: float = Field(ge=0.0, le=1.0, default=0.0)
     last_name: float = Field(ge=0.0, le=1.0, default=0.0)
     document_number: float = Field(ge=0.0, le=1.0, default=0.0)
     date_of_birth: float = Field(ge=0.0, le=1.0, default=0.0)
@@ -27,6 +28,7 @@ class ConfidenceScores(BaseModel):
 class ScanResponse(BaseModel):
     type: DocumentType
     first_name: str | None = None
+    middle_name: str | None = None
     last_name: str | None = None
     document_number: str | None = None
     date_of_birth: date | None = None

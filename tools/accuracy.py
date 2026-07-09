@@ -2,7 +2,7 @@
 """Measure scan accuracy against a labelled fixture set.
 
 Sends each image to a *running* orc-service over HTTP (same path a real caller /
-curl uses), compares the 6 returned fields against ground truth, and prints a
+curl uses), compares the 7 returned fields against ground truth, and prints a
 per-field + per-document accuracy report.
 
 Usage:
@@ -36,6 +36,7 @@ from pathlib import Path
 # Fields we score, in report order.
 FIELDS = [
     "first_name",
+    "middle_name",
     "last_name",
     "document_number",
     "date_of_birth",
