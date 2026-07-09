@@ -5,7 +5,8 @@ from datetime import date
 
 import numpy as np
 
-from app.preprocessing import preprocess
+from app.confidence import tier_from_id_checksum, tier_from_ocr_score
+from app.preprocessing import preprocess, rotations
 from app.scan_error import ScanError
 from app.schemas import ConfidenceScores, DocumentType, ScanResponse, Sex
 from app.validators import thai_id_checksum
@@ -153,7 +154,12 @@ def _first_alpha_token(text: str) -> str | None:
     return None
 
 
-NAME_STOPWORDS = {"MR", "MRS", "MISS", "MASTER", "MISTER", "LAST", "NAME", "LASTNAME"}
+NAME_STOPWORDS = {
+    "MR", "MRS", "MISS", "MASTER", "MISTER", "LAST", "NAME", "LASTNAME",
+    # Other field labels a loose positional fallback could otherwise mistake for a name.
+    "DATE", "BIRTH", "OF", "ISSUE", "EXPIRY", "IDENTIFICATION", "NUMBER",
+    "RELIGION", "ADDRESS", "SEX",
+}
 
 
 GLUED_TITLE_RE = re.compile(r"^(?:mr|mrs|miss|master|mister)\.?", re.IGNORECASE)
@@ -203,6 +209,20 @@ def _name_candidates(anchor: OcrLine, lines: list[OcrLine], tol: float) -> list[
     return cands
 
 
+def _column_candidates(anchor: OcrLine, lines: list[OcrLine], max_dx: float = 100.0) -> list[OcrLine]:
+    """Other lines roughly in the same vertical column as `anchor`, nearest first.
+
+    Fallback for when a label OCR'd cleanly but its value isn't to the right or directly
+    below — seen on skewed/rotated captures where "below" on the physical card doesn't map to
+    "below" in pixel space. Excludes lines that mention "name" so a Name/Last name label row
+    can't be mistaken for another label's value."""
+    others = [
+        ln for ln in lines
+        if ln is not anchor and abs(ln.cx - anchor.cx) < max_dx and "name" not in ln.text.lower()
+    ]
+    return sorted(others, key=lambda ln: abs(ln.cy - anchor.cy))
+
+
 def extract_first_name(lines: list[OcrLine]) -> tuple[str | None, float]:
     # Strategy A: explicit English title prefix inline ("Mr. KITTIKHUN")
     for line in lines:
@@ -236,6 +256,11 @@ def extract_last_name(lines: list[OcrLine]) -> tuple[str | None, float]:
             if tok:
                 return tok, line.confidence
             for cand in _name_candidates(line, lines, tol):
+                tok = _name_token(cand.text)
+                if tok:
+                    return tok, cand.confidence
+            # Label found but its value isn't to the right or below — widen to the column.
+            for cand in _column_candidates(line, lines):
                 tok = _name_token(cand.text)
                 if tok:
                     return tok, cand.confidence
@@ -364,9 +389,19 @@ def scan_thai_id_from_lines(lines: list[OcrLine]) -> tuple[ScanResponse | None, 
     if id_num is None and not (_has_id_card_markers(lines) and any([first, last, dob, sex])):
         return None, ScanError("no_document_detected")
 
-    field_confs = [id_conf, first_conf, last_conf, dob_conf, sex_conf]
+    # document_number's checksum is a stronger correctness signal than PaddleOCR's own score —
+    # it dominates the tier (always MAX when valid) instead of blending with it. The other
+    # fields have no independent verification, so their tier IS the OCR engine's own score,
+    # just bucketed onto the same 5-level scale for comparability.
+    id_tier = tier_from_id_checksum(id_num is not None, id_valid, id_conf)
+    first_tier = tier_from_ocr_score(first_conf)
+    last_tier = tier_from_ocr_score(last_conf)
+    dob_tier = tier_from_ocr_score(dob_conf)
+    sex_tier = tier_from_ocr_score(sex_conf)
+
+    field_confs = [id_tier, first_tier, last_tier, dob_tier, sex_tier]
     populated = [c for c in field_confs if c > 0]
-    overall = sum(populated) / len(populated) if populated else 0.0
+    overall = min(populated) if populated else 0.0
 
     warnings: list[str] = []
     if id_num is None:
@@ -386,11 +421,11 @@ def scan_thai_id_from_lines(lines: list[OcrLine]) -> tuple[ScanResponse | None, 
             document_valid=id_valid,
             confidence=ConfidenceScores(
                 overall=overall,
-                first_name=first_conf,
-                last_name=last_conf,
-                document_number=id_conf,
-                date_of_birth=dob_conf,
-                sex=sex_conf,
+                first_name=first_tier,
+                last_name=last_tier,
+                document_number=id_tier,
+                date_of_birth=dob_tier,
+                sex=sex_tier,
                 country=1.0,
             ),
             warnings=warnings,
@@ -399,9 +434,100 @@ def scan_thai_id_from_lines(lines: list[OcrLine]) -> tuple[ScanResponse | None, 
     )
 
 
+def _is_complete(response: ScanResponse) -> bool:
+    """True once nothing further could be gained from trying more rotations."""
+    return response.document_valid and all(
+        v is not None
+        for v in (response.first_name, response.last_name, response.date_of_birth, response.sex)
+    )
+
+
+def _merge_rotation_reads(responses: list[ScanResponse]) -> ScanResponse:
+    """Combine reads from multiple rotations of the same physical card, keeping the
+    highest-confidence value for each field independently.
+
+    A card photographed at an angle often OCRs one field cleanly in one rotation (e.g. the ID
+    number) and a different field cleanly in another (e.g. the surname, whose label is small
+    and easily misread) — picking a single "best" rotation would discard whichever fields lost
+    out in that rotation even though another rotation read them fine."""
+    valid = [r for r in responses if r.document_valid]
+    id_pool = valid or responses
+    # Prefer the id number multiple independent rotations agree on over the single most
+    # "confident" read — a checksum only guards against random digit errors, so one rotation can
+    # still land on a coincidentally checksum-valid misread (e.g. unrelated digits printed
+    # elsewhere on the card) with high per-line OCR confidence. Agreement across rotations that
+    # each re-detected and re-read the number from scratch is the stronger correctness signal.
+    id_agreement: dict[str | None, int] = {}
+    for r in id_pool:
+        id_agreement[r.document_number] = id_agreement.get(r.document_number, 0) + 1
+    id_source = max(
+        id_pool,
+        key=lambda r: (id_agreement[r.document_number], r.confidence.document_number),
+    )
+
+    def pick(field: str, conf_field: str) -> tuple[object | None, float]:
+        candidates = [r for r in responses if getattr(r, field) is not None]
+        if not candidates:
+            return None, 0.0
+        best = max(candidates, key=lambda r: getattr(r.confidence, conf_field))
+        return getattr(best, field), getattr(best.confidence, conf_field)
+
+    first, first_conf = pick("first_name", "first_name")
+    last, last_conf = pick("last_name", "last_name")
+    dob, dob_conf = pick("date_of_birth", "date_of_birth")
+    sex, sex_conf = pick("sex", "sex")
+
+    field_confs = [id_source.confidence.document_number, first_conf, last_conf, dob_conf, sex_conf]
+    populated = [c for c in field_confs if c > 0]
+    overall = min(populated) if populated else 0.0
+
+    warnings: list[str] = []
+    if id_source.document_number is None:
+        warnings.append("id_number_unreadable")
+    elif not id_source.document_valid:
+        warnings.append("thai_id_checksum_failed")
+
+    return ScanResponse(
+        type=DocumentType.THAI_ID,
+        first_name=first,
+        last_name=last,
+        document_number=id_source.document_number,
+        date_of_birth=dob,
+        sex=sex,
+        country="THA",
+        document_valid=id_source.document_valid,
+        confidence=ConfidenceScores(
+            overall=overall,
+            first_name=first_conf,
+            last_name=last_conf,
+            document_number=id_source.confidence.document_number,
+            date_of_birth=dob_conf,
+            sex=sex_conf,
+            country=1.0,
+        ),
+        warnings=warnings,
+    )
+
+
 def scan_thai_id(image_bytes: bytes) -> tuple[ScanResponse | None, ScanError | None]:
     img = preprocess(image_bytes)
     if img is None:
         return None, ScanError("image_invalid")
-    lines = _run_ocr(img)
-    return scan_thai_id_from_lines(lines)
+
+    # Try all 4 cardinal orientations — a card photographed upside-down or sideways otherwise
+    # OCRs as noise. Stops as soon as a rotation reads every field (the common upright case
+    # still costs a single OCR pass); otherwise every rotation tried gets merged field-by-field
+    # so a field missed in one rotation can still be recovered from another.
+    responses: list[ScanResponse] = []
+    for _deg, rotated in rotations(img):
+        lines = _run_ocr(rotated)
+        response, _error = scan_thai_id_from_lines(lines)
+        if response is None:
+            continue
+        responses.append(response)
+        if _is_complete(response):
+            break
+
+    if not responses:
+        return None, ScanError("no_document_detected")
+    return _merge_rotation_reads(responses), None
