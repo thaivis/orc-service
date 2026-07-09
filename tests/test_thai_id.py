@@ -1,5 +1,6 @@
 from datetime import date
 
+from app.scanners import thai_id as thai_id_module
 from app.scanners.thai_id import (
     OcrLine,
     extract_dob,
@@ -7,6 +8,7 @@ from app.scanners.thai_id import (
     extract_id_number,
     extract_last_name,
     extract_sex,
+    scan_thai_id,
     scan_thai_id_from_lines,
 )
 from app.schemas import DocumentType, Sex
@@ -124,6 +126,32 @@ def test_extract_last_name_inline():
     assert name == "JAIDEE"
 
 
+def test_extract_last_name_falls_back_to_same_column_above_label():
+    """On some rotated/skewed captures the value box lands above its label instead of below
+    or to the right — the strict same-row/below search must fall back to scanning the column."""
+    lines = [
+        OcrLine(text="Date of Birth 29 Aug. 2003", confidence=0.96, cx=442.8, cy=623.2),
+        OcrLine(text="JAIDEE", confidence=1.0, cx=322.8, cy=625.2),
+        OcrLine(text="NameMr. SOMCHAI", confidence=0.96, cx=262.5, cy=707.0),
+        OcrLine(text="Last name", confidence=0.83, cx=327.5, cy=827.5),
+    ]
+    name, conf = extract_last_name(lines)
+    assert name == "JAIDEE"
+    assert conf == 1.0
+
+
+def test_extract_last_name_column_fallback_ignores_other_labels():
+    """The column fallback must not mistake a nearby field label (e.g. a Date of Birth line
+    outside the column tolerance, or a Name line inside it) for the surname value."""
+    lines = [
+        OcrLine(text="Date of Birth 29 Aug. 2003", confidence=0.96, cx=900.0, cy=625.2),
+        OcrLine(text="NameMr. SOMCHAI", confidence=0.96, cx=262.5, cy=707.0),
+        OcrLine(text="Last name", confidence=0.83, cx=327.5, cy=827.5),
+    ]
+    name, _ = extract_last_name(lines)
+    assert name is None
+
+
 def test_extract_first_name_returns_none_when_absent():
     name, conf = extract_first_name([OcrLine(text="Identification", confidence=0.9)])
     assert name is None
@@ -225,3 +253,141 @@ def test_synthetic_id_helper_passes_checksum():
     """Sanity check on the test helper itself."""
     assert thai_id_checksum(_valid_id())
     assert not thai_id_checksum(_invalid_id())
+
+
+# --- scan_thai_id rotation retry ---
+
+def test_scan_thai_id_recovers_via_rotation(monkeypatch):
+    """A card photographed upside-down only OCRs cleanly at one of the 4 cardinal rotations —
+    scan_thai_id must retry them instead of giving up after the unrotated pass."""
+    valid = _valid_id()
+    good_lines = [OcrLine(text=valid, confidence=0.95)]
+
+    monkeypatch.setattr(thai_id_module, "preprocess", lambda image_bytes: "preprocessed")
+    monkeypatch.setattr(
+        thai_id_module, "rotations",
+        lambda img: [(0, "r0"), (90, "r90"), (180, "r180"), (270, "r270")],
+    )
+    monkeypatch.setattr(
+        thai_id_module, "_run_ocr",
+        lambda rotated: good_lines if rotated == "r180" else [],
+    )
+
+    result, err = scan_thai_id(b"fake-bytes")
+    assert err is None
+    assert result is not None
+    assert result.document_number == valid
+    assert result.document_valid is True
+
+
+def test_scan_thai_id_short_circuits_on_first_complete_rotation(monkeypatch):
+    """The common case (card already upright, every field read) must not pay for extra OCR passes."""
+    valid = _valid_id()
+    good_lines = [
+        OcrLine(text=valid, confidence=0.95),
+        OcrLine(text="นาย SOMCHAI", confidence=0.9, cx=100, cy=50),
+        OcrLine(text="Name SOMCHAI", confidence=0.9, cx=100, cy=80),
+        OcrLine(text="Last name JAIDEE", confidence=0.92, cx=100, cy=120),
+        OcrLine(text="Date of Birth 1 Jan. 1990", confidence=0.88),
+    ]
+    calls: list[str] = []
+
+    monkeypatch.setattr(thai_id_module, "preprocess", lambda image_bytes: "preprocessed")
+    monkeypatch.setattr(
+        thai_id_module, "rotations",
+        lambda img: [(0, "r0"), (90, "r90"), (180, "r180"), (270, "r270")],
+    )
+
+    def fake_run_ocr(rotated):
+        calls.append(rotated)
+        return good_lines
+
+    monkeypatch.setattr(thai_id_module, "_run_ocr", fake_run_ocr)
+
+    result, err = scan_thai_id(b"fake-bytes")
+    assert err is None
+    assert result is not None
+    assert calls == ["r0"]
+
+
+def test_scan_thai_id_returns_no_document_when_all_rotations_fail(monkeypatch):
+    monkeypatch.setattr(thai_id_module, "preprocess", lambda image_bytes: "preprocessed")
+    monkeypatch.setattr(thai_id_module, "rotations", lambda img: [(0, "r0"), (180, "r180")])
+    monkeypatch.setattr(thai_id_module, "_run_ocr", lambda rotated: [])
+
+    result, err = scan_thai_id(b"fake-bytes")
+    assert result is None
+    assert err is not None
+    assert err.code == "no_document_detected"
+
+
+def test_scan_thai_id_merges_fields_across_rotations(monkeypatch):
+    """A checksum-valid ID number can appear in more than one rotation while different fields
+    read cleanly in each — e.g. the surname's label OCRs correctly only when the card lands at
+    a different angle. The final result must not lose a field a later rotation did recover."""
+    valid = _valid_id()
+    # r0: valid checksum, first name reads fine, last name label never detected.
+    r0_lines = [
+        OcrLine(text=valid, confidence=0.95),
+        OcrLine(text="Name Mr. SOMCHAI", confidence=0.95, cx=100, cy=80),
+    ]
+    # r90: also a valid checksum (same document, different rotation), last name reads fine
+    # but first name does not.
+    r90_lines = [
+        OcrLine(text=valid, confidence=0.9),
+        OcrLine(text="Last name", confidence=0.95, cx=100, cy=120),
+        OcrLine(text="JAIDEE", confidence=0.97, cx=110, cy=150),
+    ]
+
+    monkeypatch.setattr(thai_id_module, "preprocess", lambda image_bytes: "preprocessed")
+    monkeypatch.setattr(
+        thai_id_module, "rotations",
+        lambda img: [(0, "r0"), (90, "r90"), (180, "r180"), (270, "r270")],
+    )
+    monkeypatch.setattr(
+        thai_id_module, "_run_ocr",
+        lambda rotated: {"r0": r0_lines, "r90": r90_lines}.get(rotated, []),
+    )
+
+    result, err = scan_thai_id(b"fake-bytes")
+    assert err is None
+    assert result is not None
+    assert result.document_number == valid
+    assert result.document_valid is True
+    assert result.first_name == "SOMCHAI"
+    assert result.last_name == "JAIDEE"
+
+
+def test_scan_thai_id_prefers_id_number_multiple_rotations_agree_on(monkeypatch):
+    """A single rotation can land on a *different*, coincidentally checksum-valid 13-digit
+    number read with high per-line confidence (e.g. unrelated digits printed elsewhere on the
+    card) — this must not outrank the number two independent rotations agree on."""
+    correct = _valid_id()
+    # Construct a second, different checksum-valid number to act as the confident-but-wrong read.
+    other_base = "110170015765"
+    other_total = sum(int(other_base[i]) * (13 - i) for i in range(12))
+    other_check = (11 - (other_total % 11)) % 10
+    wrong = other_base + str(other_check)
+    assert wrong != correct
+
+    lines_by_rotation = {
+        # Higher single-line confidence, but only one rotation reads this number.
+        "r0": [OcrLine(text=wrong, confidence=1.0)],
+        "r90": [OcrLine(text=correct, confidence=0.85)],
+        "r180": [OcrLine(text=correct, confidence=0.85)],
+    }
+
+    monkeypatch.setattr(thai_id_module, "preprocess", lambda image_bytes: "preprocessed")
+    monkeypatch.setattr(
+        thai_id_module, "rotations",
+        lambda img: [(0, "r0"), (90, "r90"), (180, "r180"), (270, "r270")],
+    )
+    monkeypatch.setattr(
+        thai_id_module, "_run_ocr",
+        lambda rotated: lines_by_rotation.get(rotated, []),
+    )
+
+    result, err = scan_thai_id(b"fake-bytes")
+    assert err is None
+    assert result is not None
+    assert result.document_number == correct

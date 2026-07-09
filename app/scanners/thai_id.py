@@ -5,7 +5,8 @@ from datetime import date
 
 import numpy as np
 
-from app.preprocessing import preprocess
+from app.confidence import tier_from_id_checksum, tier_from_ocr_score
+from app.preprocessing import preprocess, rotations
 from app.scan_error import ScanError
 from app.schemas import ConfidenceScores, DocumentType, ScanResponse, Sex
 from app.validators import thai_id_checksum
@@ -70,8 +71,13 @@ def _find_below(anchor: OcrLine, lines: list[OcrLine], max_dx: float = 100.0) ->
 # --- ID number ---
 
 def extract_id_number(lines: list[OcrLine]) -> tuple[str | None, float, bool]:
-    """Returns (id_str_13_digits, confidence, checksum_valid). Prefers checksum-valid match."""
+    """Returns (id_str_13_digits, confidence, checksum_valid). Prefers checksum-valid match.
+
+    Handles two OCR shapes: a single line holding the whole number, and a number that
+    PaddleOCR split across several detections (e.g. '1' '8399' '01779' '295') — common on
+    sharp, straight scans where each digit group becomes its own text box."""
     fallback: tuple[str, float] | None = None
+    # Fast path: one line already contains all 13 digits.
     for line in lines:
         digits = re.sub(r"\D", "", line.text)
         if len(digits) == 13:
@@ -79,6 +85,23 @@ def extract_id_number(lines: list[OcrLine]) -> tuple[str | None, float, bool]:
                 return digits, line.confidence, True
             if fallback is None:
                 fallback = (digits, line.confidence)
+    # Fragmented path: concatenate consecutive digit runs and accept the first checksum-valid
+    # 13-digit window. The checksum gates against false joins (dates, card/laser numbers).
+    runs: list[tuple[str, float]] = [
+        (m.group(), line.confidence)
+        for line in lines
+        for m in re.finditer(r"\d+", line.text)
+    ]
+    for i in range(len(runs)):
+        joined = ""
+        confs: list[float] = []
+        for digits, conf in runs[i:]:
+            joined += digits
+            confs.append(conf)
+            if len(joined) >= 13:
+                if len(joined) == 13 and thai_id_checksum(joined):
+                    return joined, sum(confs) / len(confs), True
+                break
     if fallback is not None:
         return fallback[0], fallback[1], False
     return None, 0.0, False
@@ -90,15 +113,24 @@ THAI_TITLE_TO_SEX: dict[str, str] = {
     "เด็กชาย": "M",
     "เด็กหญิง": "F",
     "นางสาว": "F",  # check before "นาง" since it's a longer prefix containing "นาง"
+    "น.ส.": "F",
     "นาย": "M",
     "นาง": "F",
 }
+
+EN_TITLE_TO_SEX = {"mr": "M", "mister": "M", "master": "M", "mrs": "F", "miss": "F"}
+
 
 def extract_sex(lines: list[OcrLine]) -> tuple[Sex | None, float]:
     for line in lines:
         for prefix, s in THAI_TITLE_TO_SEX.items():
             if prefix in line.text:
                 return Sex(s), line.confidence
+    # English title fallback — some cards OCR the Thai title poorly (e.g. 'น.ส.' → 'Miss')
+    for line in lines:
+        m = re.search(r"\b(mr|mrs|miss|master|mister)\b", line.text, re.IGNORECASE)
+        if m:
+            return Sex(EN_TITLE_TO_SEX[m.group(1).lower()]), line.confidence
     return None, 0.0
 
 
@@ -122,41 +154,116 @@ def _first_alpha_token(text: str) -> str | None:
     return None
 
 
+NAME_STOPWORDS = {
+    "MR", "MRS", "MISS", "MASTER", "MISTER", "LAST", "NAME", "LASTNAME",
+    # Other field labels a loose positional fallback could otherwise mistake for a name.
+    "DATE", "BIRTH", "OF", "ISSUE", "EXPIRY", "IDENTIFICATION", "NUMBER",
+    "RELIGION", "ADDRESS", "SEX",
+}
+
+
+GLUED_TITLE_RE = re.compile(r"^(?:mr|mrs|miss|master|mister)\.?", re.IGNORECASE)
+
+
+def _name_token(text: str) -> str | None:
+    """First A-Za-z token in `text`, upper-cased, skipping titles and label words.
+
+    Also peels a title glued to the name when OCR drops the space ("Mr.Channarong")."""
+    for tok in _strip_title(text).split():
+        cleaned = re.sub(r"[^A-Za-z\-]", "", tok)
+        deglued = GLUED_TITLE_RE.sub("", cleaned)
+        if len(deglued) >= 2:  # only peel when a real name remains
+            cleaned = deglued
+        cleaned = cleaned.upper()
+        if cleaned and cleaned not in NAME_STOPWORDS:
+            return cleaned
+    return None
+
+
+def _row_tol(lines: list[OcrLine]) -> float:
+    """Vertical tolerance for 'same row', scaled to the image so it holds at any resolution."""
+    cys = [ln.cy for ln in lines]
+    if not cys:
+        return 8.0
+    return max(8.0, (max(cys) - min(cys)) * 0.02)
+
+
+def _same_row_right(anchor: OcrLine, lines: list[OcrLine], tol: float) -> list[OcrLine]:
+    """Lines on the same text row as `anchor`, to its right, ordered left-to-right.
+
+    PaddleOCR often emits a field's label and value as separate boxes with the value to the
+    right; searching 'below' misses those, so we scan rightward on the row first."""
+    same = [
+        ln for ln in lines
+        if ln is not anchor and abs(ln.cy - anchor.cy) <= tol and ln.cx > anchor.cx
+    ]
+    return sorted(same, key=lambda ln: ln.cx)
+
+
+def _name_candidates(anchor: OcrLine, lines: list[OcrLine], tol: float) -> list[OcrLine]:
+    """Value boxes to try for a label: same-row-right first, then the line below."""
+    cands = _same_row_right(anchor, lines, tol)
+    below = _find_below(anchor, lines)
+    if below is not None:
+        cands.append(below)
+    return cands
+
+
+def _column_candidates(anchor: OcrLine, lines: list[OcrLine], max_dx: float = 100.0) -> list[OcrLine]:
+    """Other lines roughly in the same vertical column as `anchor`, nearest first.
+
+    Fallback for when a label OCR'd cleanly but its value isn't to the right or directly
+    below — seen on skewed/rotated captures where "below" on the physical card doesn't map to
+    "below" in pixel space. Excludes lines that mention "name" so a Name/Last name label row
+    can't be mistaken for another label's value."""
+    others = [
+        ln for ln in lines
+        if ln is not anchor and abs(ln.cx - anchor.cx) < max_dx and "name" not in ln.text.lower()
+    ]
+    return sorted(others, key=lambda ln: abs(ln.cy - anchor.cy))
+
+
 def extract_first_name(lines: list[OcrLine]) -> tuple[str | None, float]:
-    # Strategy A: explicit English title prefix anywhere
+    # Strategy A: explicit English title prefix inline ("Mr. KITTIKHUN")
     for line in lines:
         m = EN_TITLE_RE.search(line.text)
         if m:
             return m.group(1).upper(), line.confidence
-    # Strategy B: anchor on "Name" label (excluding "Last Name")
+    # Strategy B: anchor on the "Name" label (excluding "Last Name"); value may be inline,
+    # to the right on the same row, or on the line below.
+    tol = _row_tol(lines)
     for line in lines:
         low = line.text.lower()
         if "name" in low and "last" not in low:
             after = re.sub(r"^.*?name\s*[:\-]?\s*", "", line.text, count=1, flags=re.IGNORECASE)
-            tok = _first_alpha_token(after)
+            tok = _name_token(after)
             if tok:
                 return tok, line.confidence
-            below = _find_below(line, lines)
-            if below:
-                tok = _first_alpha_token(_strip_title(below.text))
+            for cand in _name_candidates(line, lines, tol):
+                tok = _name_token(cand.text)
                 if tok:
-                    return tok, below.confidence
+                    return tok, cand.confidence
     return None, 0.0
 
 
 def extract_last_name(lines: list[OcrLine]) -> tuple[str | None, float]:
+    tol = _row_tol(lines)
     for line in lines:
         low = line.text.lower()
-        if "last name" in low or "lastname" in low or "last  name" in low:
-            after = re.sub(r"^.*?last\s*name\s*[:\-]?\s*", "", line.text, count=1, flags=re.IGNORECASE)
-            tok = _first_alpha_token(after)
+        if re.search(r"last\s*nam", low):  # tolerate OCR dropping the trailing 'e' ("Last nam")
+            after = re.sub(r"^.*?last\s*nam(?:e)?\s*[:\-]?\s*", "", line.text, count=1, flags=re.IGNORECASE)
+            tok = _name_token(after)
             if tok:
                 return tok, line.confidence
-            below = _find_below(line, lines)
-            if below:
-                tok = _first_alpha_token(below.text)
+            for cand in _name_candidates(line, lines, tol):
+                tok = _name_token(cand.text)
                 if tok:
-                    return tok, below.confidence
+                    return tok, cand.confidence
+            # Label found but its value isn't to the right or below — widen to the column.
+            for cand in _column_candidates(line, lines):
+                tok = _name_token(cand.text)
+                if tok:
+                    return tok, cand.confidence
     return None, 0.0
 
 
@@ -210,20 +317,31 @@ def _parse_thai_date(text: str) -> date | None:
     return _try_make_date(year, month, day)
 
 
+def _parse_en_date(text: str) -> date | None:
+    m = DATE_EN_RE.search(text)
+    if not m:
+        return None
+    month = EN_MONTHS.get(m.group(2)[:3].lower())
+    if month is None:
+        return None
+    return _try_make_date(_be_to_ce(int(m.group(3))), month, int(m.group(1)))
+
+
 def extract_dob(lines: list[OcrLine]) -> tuple[date | None, float]:
-    # English date first (more reliable on Thai ID)
+    tol = _row_tol(lines)
+    # Anchored: reconstruct the date from the "Date of Birth" / "เกิด" row. This both avoids
+    # grabbing the issue/expiry date and stitches a date PaddleOCR split into separate tokens.
     for line in lines:
-        m = DATE_EN_RE.search(line.text)
-        if m:
-            month = EN_MONTHS.get(m.group(2)[:3].lower())
-            if month is None:
-                continue
-            day = int(m.group(1))
-            year = _be_to_ce(int(m.group(3)))
-            d = _try_make_date(year, month, day)
+        if "birth" in line.text.lower() or "เกิด" in line.text:
+            row_text = " ".join([line.text] + [c.text for c in _same_row_right(line, lines, tol)])
+            d = _parse_en_date(row_text) or _parse_thai_date(row_text)
             if d:
                 return d, line.confidence
-    # Thai date fallback
+    # Fallback: first parseable date anywhere (English preferred, then Thai).
+    for line in lines:
+        d = _parse_en_date(line.text)
+        if d:
+            return d, line.confidence
     for line in lines:
         d = _parse_thai_date(line.text)
         if d:
@@ -249,23 +367,46 @@ def looks_like_thai_id(img: np.ndarray) -> bool:
     return False
 
 
+def _has_id_card_markers(lines: list[OcrLine]) -> bool:
+    """True when the lines carry unmistakable Thai-ID header text, even if the number itself
+    didn't OCR. Lets low-res cards still return the fields that *were* read instead of a bare 422."""
+    for line in lines:
+        if "บัตรประจำตัวประชาชน" in line.text or "thai national id" in line.text.lower():
+            return True
+    return False
+
+
 def scan_thai_id_from_lines(lines: list[OcrLine]) -> tuple[ScanResponse | None, ScanError | None]:
     """Build ScanResponse from already-OCR'd lines. Pure function — used directly by tests."""
     id_num, id_conf, id_valid = extract_id_number(lines)
-    if id_num is None:
-        return None, ScanError("no_document_detected")
-
     first, first_conf = extract_first_name(lines)
     last, last_conf = extract_last_name(lines)
     dob, dob_conf = extract_dob(lines)
     sex, sex_conf = extract_sex(lines)
 
-    field_confs = [id_conf, first_conf, last_conf, dob_conf, sex_conf]
+    # No ID number: only accept the card if it clearly *is* a Thai ID (header present) AND we
+    # recovered at least one other field — otherwise it's genuinely not a readable document.
+    if id_num is None and not (_has_id_card_markers(lines) and any([first, last, dob, sex])):
+        return None, ScanError("no_document_detected")
+
+    # document_number's checksum is a stronger correctness signal than PaddleOCR's own score —
+    # it dominates the tier (always MAX when valid) instead of blending with it. The other
+    # fields have no independent verification, so their tier IS the OCR engine's own score,
+    # just bucketed onto the same 5-level scale for comparability.
+    id_tier = tier_from_id_checksum(id_num is not None, id_valid, id_conf)
+    first_tier = tier_from_ocr_score(first_conf)
+    last_tier = tier_from_ocr_score(last_conf)
+    dob_tier = tier_from_ocr_score(dob_conf)
+    sex_tier = tier_from_ocr_score(sex_conf)
+
+    field_confs = [id_tier, first_tier, last_tier, dob_tier, sex_tier]
     populated = [c for c in field_confs if c > 0]
-    overall = sum(populated) / len(populated) if populated else 0.0
+    overall = min(populated) if populated else 0.0
 
     warnings: list[str] = []
-    if not id_valid:
+    if id_num is None:
+        warnings.append("id_number_unreadable")
+    elif not id_valid:
         warnings.append("thai_id_checksum_failed")
 
     return (
@@ -280,11 +421,11 @@ def scan_thai_id_from_lines(lines: list[OcrLine]) -> tuple[ScanResponse | None, 
             document_valid=id_valid,
             confidence=ConfidenceScores(
                 overall=overall,
-                first_name=first_conf,
-                last_name=last_conf,
-                document_number=id_conf,
-                date_of_birth=dob_conf,
-                sex=sex_conf,
+                first_name=first_tier,
+                last_name=last_tier,
+                document_number=id_tier,
+                date_of_birth=dob_tier,
+                sex=sex_tier,
                 country=1.0,
             ),
             warnings=warnings,
@@ -293,9 +434,100 @@ def scan_thai_id_from_lines(lines: list[OcrLine]) -> tuple[ScanResponse | None, 
     )
 
 
+def _is_complete(response: ScanResponse) -> bool:
+    """True once nothing further could be gained from trying more rotations."""
+    return response.document_valid and all(
+        v is not None
+        for v in (response.first_name, response.last_name, response.date_of_birth, response.sex)
+    )
+
+
+def _merge_rotation_reads(responses: list[ScanResponse]) -> ScanResponse:
+    """Combine reads from multiple rotations of the same physical card, keeping the
+    highest-confidence value for each field independently.
+
+    A card photographed at an angle often OCRs one field cleanly in one rotation (e.g. the ID
+    number) and a different field cleanly in another (e.g. the surname, whose label is small
+    and easily misread) — picking a single "best" rotation would discard whichever fields lost
+    out in that rotation even though another rotation read them fine."""
+    valid = [r for r in responses if r.document_valid]
+    id_pool = valid or responses
+    # Prefer the id number multiple independent rotations agree on over the single most
+    # "confident" read — a checksum only guards against random digit errors, so one rotation can
+    # still land on a coincidentally checksum-valid misread (e.g. unrelated digits printed
+    # elsewhere on the card) with high per-line OCR confidence. Agreement across rotations that
+    # each re-detected and re-read the number from scratch is the stronger correctness signal.
+    id_agreement: dict[str | None, int] = {}
+    for r in id_pool:
+        id_agreement[r.document_number] = id_agreement.get(r.document_number, 0) + 1
+    id_source = max(
+        id_pool,
+        key=lambda r: (id_agreement[r.document_number], r.confidence.document_number),
+    )
+
+    def pick(field: str, conf_field: str) -> tuple[object | None, float]:
+        candidates = [r for r in responses if getattr(r, field) is not None]
+        if not candidates:
+            return None, 0.0
+        best = max(candidates, key=lambda r: getattr(r.confidence, conf_field))
+        return getattr(best, field), getattr(best.confidence, conf_field)
+
+    first, first_conf = pick("first_name", "first_name")
+    last, last_conf = pick("last_name", "last_name")
+    dob, dob_conf = pick("date_of_birth", "date_of_birth")
+    sex, sex_conf = pick("sex", "sex")
+
+    field_confs = [id_source.confidence.document_number, first_conf, last_conf, dob_conf, sex_conf]
+    populated = [c for c in field_confs if c > 0]
+    overall = min(populated) if populated else 0.0
+
+    warnings: list[str] = []
+    if id_source.document_number is None:
+        warnings.append("id_number_unreadable")
+    elif not id_source.document_valid:
+        warnings.append("thai_id_checksum_failed")
+
+    return ScanResponse(
+        type=DocumentType.THAI_ID,
+        first_name=first,
+        last_name=last,
+        document_number=id_source.document_number,
+        date_of_birth=dob,
+        sex=sex,
+        country="THA",
+        document_valid=id_source.document_valid,
+        confidence=ConfidenceScores(
+            overall=overall,
+            first_name=first_conf,
+            last_name=last_conf,
+            document_number=id_source.confidence.document_number,
+            date_of_birth=dob_conf,
+            sex=sex_conf,
+            country=1.0,
+        ),
+        warnings=warnings,
+    )
+
+
 def scan_thai_id(image_bytes: bytes) -> tuple[ScanResponse | None, ScanError | None]:
     img = preprocess(image_bytes)
     if img is None:
         return None, ScanError("image_invalid")
-    lines = _run_ocr(img)
-    return scan_thai_id_from_lines(lines)
+
+    # Try all 4 cardinal orientations — a card photographed upside-down or sideways otherwise
+    # OCRs as noise. Stops as soon as a rotation reads every field (the common upright case
+    # still costs a single OCR pass); otherwise every rotation tried gets merged field-by-field
+    # so a field missed in one rotation can still be recovered from another.
+    responses: list[ScanResponse] = []
+    for _deg, rotated in rotations(img):
+        lines = _run_ocr(rotated)
+        response, _error = scan_thai_id_from_lines(lines)
+        if response is None:
+            continue
+        responses.append(response)
+        if _is_complete(response):
+            break
+
+    if not responses:
+        return None, ScanError("no_document_detected")
+    return _merge_rotation_reads(responses), None

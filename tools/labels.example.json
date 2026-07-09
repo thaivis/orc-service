@@ -1,0 +1,23 @@
+{
+  "_comment": "Copy this to labels.json (git-ignored) and fill in real values. Each key is an image filename in this same folder. 'type' is required (thai_id | passport). Omit a field or set it to null to skip scoring it. Delete this _comment key before running.",
+
+  "fake7.jpg": {
+    "type": "thai_id",
+    "first_name": "สมชาย",
+    "last_name": "ใจดี",
+    "document_number": "1234567890123",
+    "date_of_birth": "1990-05-01",
+    "sex": "M",
+    "country": "THA"
+  },
+
+  "fake1.jpg": {
+    "type": "passport",
+    "first_name": "JOHN",
+    "last_name": "DOE",
+    "document_number": "AA1234567",
+    "date_of_birth": "1985-12-24",
+    "sex": "M",
+    "country": "USA"
+  }
+}
