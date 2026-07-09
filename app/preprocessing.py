@@ -2,7 +2,7 @@ from io import BytesIO
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from app.config import get_settings
 
@@ -13,6 +13,9 @@ def decode_image(image_bytes: bytes) -> np.ndarray | None:
     try:
         pil = Image.open(BytesIO(image_bytes))
         pil.load()
+        # Bake in EXIF orientation — otherwise a portrait phone photo decodes as raw sideways
+        # sensor data, guaranteeing the 0° OCR pass fails and every rotation retry pass runs.
+        pil = ImageOps.exif_transpose(pil)
         rgb = pil.convert("RGB")
         return np.array(rgb)[:, :, ::-1].copy()
     except Exception:

@@ -11,7 +11,7 @@ from app.confidence import (
     tier_from_unchecksummed_field,
 )
 from app.mrz import MrzParsed, _parse_name, parse_td3, td3_line2_checks
-from app.preprocessing import decode_image, preprocess, rotations
+from app.preprocessing import decode_image, normalize_size, preprocess, rotations
 from app.scan_error import ScanError
 from app.schemas import ConfidenceScores, DocumentType, ScanResponse, Sex
 
@@ -474,6 +474,11 @@ def scan_passport(image_bytes: bytes) -> tuple[ScanResponse | None, ScanError | 
     if img is None:
         return None, ScanError("image_invalid")
     raw = decode_image(image_bytes)
+    if raw is not None:
+        # Same cap `img` already goes through — Pass 1 (fastmrz on `img`) succeeds most of the
+        # time at this resolution, so the uncapped-resolution fallback passes below gain nothing
+        # from a huge original photo except unbounded CPU/RAM on Tesseract.
+        raw = normalize_size(raw)
 
     detector = _get_detector()
     fallback: MrzParsed | None = None
