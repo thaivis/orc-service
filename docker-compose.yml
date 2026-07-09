@@ -1,15 +1,27 @@
 services:
   orc-service:
-    build: .
+    build:
+      context: .
+      # paddlepaddle CPU inference segfaults on linux/arm64; the x86 AVX wheel is stable.
+      # On Apple Silicon this runs under Rosetta/QEMU emulation.
+      platforms:
+        - linux/amd64
+    platform: linux/amd64
     container_name: orc-service
     ports:
       - "${PORT:-8000}:8000"
     env_file:
       - .env
     restart: unless-stopped
+    # Persist downloaded PaddleOCR models so they survive container recreate.
+    volumes:
+      - paddlex-models:/root/.paddlex
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  paddlex-models:
