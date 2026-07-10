@@ -13,6 +13,22 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    # Right-sized from live testing against real /scan requests (not synthetic benchmarks).
+    # CPU was stepped down from 2.0 -> 1.75 -> 1.5 -> 1.25 -> 1.0; every level below 2.0 produced
+    # at least one real /scan/thai-id request that stalled past 300s (cgroup cpu.stat confirmed
+    # heavy throttling, ~79% of periods at cpu=1.5). On this host (Apple Silicon running the
+    # amd64 image under Rosetta, sharing CPU with the rest of the local dev stack: gateway/db/
+    # redis/imgproxy/minio), 2.0 is the floor - below it, latency becomes unreliable. Memory is
+    # coupled to CPU (more CPU -> more parallelism -> higher peak RSS, measured up to ~1.4GB), so
+    # 2G is kept as the safe ceiling validated across every CPU level tested.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
     # Persist downloaded PaddleOCR models so they survive container recreate.
     volumes:
       - paddlex-models:/root/.paddlex

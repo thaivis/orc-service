@@ -17,18 +17,101 @@ _ocr = None
 def _get_ocr():
     global _ocr
     if _ocr is None:
-        # Default off: MKL-DNN in paddle can segfault in slim Linux containers.
-        os.environ.setdefault("FLAGS_use_mkldnn", "0")
+        # Enabled: oneDNN-accelerated conv kernels cut per-scan OCR time ~20-27% (measured: 10
+        # consecutive predict() calls on the mobile det/rec models, 32.3s -> 23.6s avg, tighter
+        # variance too) with byte-identical detection/recognition output. paddlepaddle is pinned
+        # to 3.2.x specifically because 3.3.x has an unrelated oneDNN/PIR regression (see
+        # requirements.txt) — on this pinned version, with these mobile models, MKL-DNN ran
+        # crash-free across repeated trials.
+        os.environ.setdefault("FLAGS_use_mkldnn", "1")
         from paddleocr import PaddleOCR
 
         # PP-OCRv5 (paddleocr 3.x) is the first version with Thai in the default rec dict.
+        # `lang="th"` alone picks the heavy PP-OCRv5_server_det backbone (85MB, ResNet-vd) for
+        # detection. The mobile variant (4.8MB, PP-LCNet) is ~17x smaller and measurably lighter
+        # on both CPU and memory per scan; validated against tools/accuracy.py before shipping.
+        # Recognition must be pinned explicitly too — passing text_detection_model_name alone
+        # makes paddleocr silently drop `lang` and fall back recognition to the heavy
+        # PP-OCRv5_server_rec (82MB) instead of the Thai mobile model.
         _ocr = PaddleOCR(
-            lang="th",
+            text_detection_model_name="PP-OCRv5_mobile_det",
+            text_recognition_model_name="th_PP-OCRv5_mobile_rec",
             use_textline_orientation=True,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
         )
     return _ocr
+
+
+_det_cache: tuple | None = None
+
+
+def _detect_boxes(img: np.ndarray):
+    """Detected text boxes for `img`, reusing the previous result when it's the very same array.
+
+    The orientation probe and the first OCR pass both detect on the un-rotated card, and detection
+    scales with image area (0.4s on a 274px demo card, 3.8s on an uncropped 1500x2000 phone photo)
+    — paying it twice is pure waste. Keyed on object identity, not contents: a stale entry from a
+    concurrent scan can only miss, never return another image's boxes."""
+    global _det_cache
+    if _det_cache is not None and _det_cache[0] is img:
+        return _det_cache[1]
+    inner, det_params = _get_stages()
+    polys = list(inner.text_det_model([img], **det_params))[0]["dt_polys"]
+    _det_cache = (img, polys)
+    return polys
+
+
+def _text_reads_horizontally(img: np.ndarray) -> bool | None:
+    """True when the detected text lines are wider than tall, i.e. the card is at 0 or 180 degrees.
+
+    Detection is cheap next to recognition (~1-4s against ~17s for a full pass), and it separates
+    the {0,180} family from {90,270} cleanly: measured across every fixture, upright cards score
+    0.92-1.00 of boxes wider than tall, sideways ones 0.00-0.17. It cannot tell 0 from 180 (both
+    are horizontal) — that stays the rotation loop's job. Textline-orientation angles look like
+    they should answer that, but measured on the fixtures they don't: physically flipping
+    IMG_2729 moves its 180-degree share from 0.19 to 0.13, and nattaya's from 0.00 to 0.00.
+
+    Deliberately not decided from the image's own aspect ratio: when `detect_document_boundary`
+    fails to find the card, the frame keeps the phone's portrait shape while the text inside is
+    perfectly upright (IMG_2730 in the fixtures), and an aspect-ratio test gets that backwards.
+
+    Returns None when detection can't answer, so callers keep the original all-rotations order."""
+    inner, _det_params = _get_stages()
+    if inner is None:
+        return None
+    try:
+        polys = _detect_boxes(img)
+    except Exception:
+        return None
+    if len(polys) == 0:
+        return None
+    wide = sum(
+        1 for p in polys
+        if (max(q[0] for q in p) - min(q[0] for q in p))
+        > (max(q[1] for q in p) - min(q[1] for q in p))
+    )
+    return wide * 2 >= len(polys)
+
+
+def _rotation_plan(img: np.ndarray) -> tuple[list[tuple[int, np.ndarray]], list[tuple[int, np.ndarray]]]:
+    """Split the 4 cardinal rotations into (try first, fall back to) by detected text direction.
+
+    A wrong rotation can produce a checksum-valid but wholly wrong ID number (measured: IMG_2729
+    at 270 degrees reads 1242565242022 and satisfies `_is_complete`), so the fallback half is
+    never discarded outright — it is skipped only once the preferred half has actually read
+    something off the card, which is evidence the detector called the direction correctly.
+
+    When detection can't answer, everything lands in the first list and behaviour is unchanged."""
+    rots = rotations(img)
+    horizontal = _text_reads_horizontally(img)
+    if horizontal is None:
+        return rots, []
+    preferred = (0, 180) if horizontal else (90, 270)
+    return (
+        [r for r in rots if r[0] in preferred],
+        [r for r in rots if r[0] not in preferred],
+    )
 
 
 @dataclass
@@ -39,24 +122,117 @@ class OcrLine:
     cy: float = 0.0
 
 
-def _run_ocr(img: np.ndarray) -> list[OcrLine]:
+_stages: tuple | None = None
+_REC_BATCH = 6
+
+
+def _get_stages():
+    """The pipeline's own detection / textline-orientation / recognition models, plus the exact
+    detection parameters `predict()` would pass them.
+
+    Recognition dominates a scan (~85% of the time, and it scales with the number of detected
+    boxes, not the image's size), but `predict()` only recognizes all-or-nothing. Driving the
+    sub-models directly lets recognition stop once every field has been read — a Thai ID detects
+    16-36 text lines and the six fields we return all sit in the first dozen, so the rest are the
+    address, religion, issue/expiry dates and signature, recognized and then thrown away.
+
+    Reusing the pipeline's own model objects (rather than constructing new ones) is what keeps
+    detection faithful: a standalone TextDetection silently uses the model's default thresholds
+    while the pipeline configures limit_side_len=64/limit_type=min/box_thresh=0.6/unclip_ratio=1.5,
+    and different boxes mean different line merges and different text.
+
+    Returns (None, None) if paddlex's internals ever stop matching the pinned 3.5.x layout, so
+    callers transparently fall back to the whole-image `predict()` path."""
+    global _stages
+    if _stages is None:
+        try:
+            inner = _get_ocr().paddlex_pipeline._pipeline
+            params = inner.get_text_det_params(
+                inner.text_det_limit_side_len,
+                inner.text_det_limit_type,
+                inner.text_det_max_side_limit,
+                inner.text_det_thresh,
+                inner.text_det_box_thresh,
+                inner.text_det_unclip_ratio,
+            )
+            # Touch every attribute the fast path needs, so a layout change fails here (and falls
+            # back) rather than halfway through a scan.
+            _ = (inner.text_det_model, inner.text_rec_model,
+                 inner.textline_orientation_model, inner._sort_boxes,
+                 inner._crop_by_polys, inner.rotate_image)
+            _stages = (inner, params)
+        except Exception:
+            _stages = (None, None)
+    return _stages
+
+
+def _line_from(text: str, score: float, poly) -> OcrLine:
+    xs = [float(p[0]) for p in poly]
+    ys = [float(p[1]) for p in poly]
+    return OcrLine(
+        text=str(text).strip(),
+        confidence=float(score),
+        cx=sum(xs) / len(xs),
+        cy=sum(ys) / len(ys),
+    )
+
+
+def _run_ocr_full(img: np.ndarray) -> list[OcrLine]:
+    """Whole-image OCR. Fallback for when the sub-model fast path is unavailable."""
     raw = _get_ocr().predict(img)
     if not raw:
         return []
     out: list[OcrLine] = []
     for res in raw:
         for text, conf, poly in zip(res["rec_texts"], res["rec_scores"], res["rec_polys"]):
-            xs = [float(p[0]) for p in poly]
-            ys = [float(p[1]) for p in poly]
-            out.append(
-                OcrLine(
-                    text=str(text).strip(),
-                    confidence=float(conf),
-                    cx=sum(xs) / len(xs),
-                    cy=sum(ys) / len(ys),
-                )
-            )
+            out.append(_line_from(text, conf, poly))
     return out
+
+
+def _run_ocr(img: np.ndarray) -> list[OcrLine]:
+    """Detect every text box, then recognize them top-to-bottom only until the fields are all read.
+
+    `_sort_boxes` orders boxes down the card, and a Thai ID puts the ID number, name, surname,
+    title (which gives sex) and date of birth above everything else, so completeness is reached
+    long before the last box. Cards that never complete — an ID number too blurred to pass its
+    checksum, a card with no legible surname — recognize every box, exactly as before.
+
+    Recognizing a subset necessarily changes how boxes are batched, and recognition pads each
+    batch to its widest crop, so a few characters can differ from what whole-image `predict()`
+    returns (measured: '24 May 2022' vs '24.May2022' on an issue-date line we don't read). Field
+    accuracy is validated against tools/accuracy.py rather than assumed from text equality."""
+    inner, _det_params = _get_stages()
+    if inner is None:
+        return _run_ocr_full(img)
+
+    polys = inner._sort_boxes(_detect_boxes(img))
+    if len(polys) == 0:
+        return []
+
+    crops, boxes = [], []
+    for crop, poly in zip(inner._crop_by_polys(img, polys), polys):
+        if crop.size > 0 and crop.shape[0] > 0 and crop.shape[1] > 0:
+            crops.append(crop)
+            boxes.append(poly)
+
+    lines: list[OcrLine] = []
+    for start in range(0, len(crops), _REC_BATCH):
+        chunk = crops[start:start + _REC_BATCH]
+        angles = [
+            int(np.asarray(info["class_ids"], dtype=np.int64).ravel()[0])
+            for info in inner.textline_orientation_model(chunk)
+        ]
+        chunk = inner.rotate_image(chunk, angles)
+        for res, poly in zip(
+            inner.text_rec_model(chunk, batch_size=len(chunk)),
+            boxes[start:start + _REC_BATCH],
+        ):
+            lines.append(_line_from(res["rec_text"], res["rec_score"], poly))
+
+        response, _error = scan_thai_id_from_lines(lines)
+        if response is not None and _is_complete(response):
+            break
+    return lines
 
 
 def _find_below(anchor: OcrLine, lines: list[OcrLine], max_dx: float = 100.0) -> OcrLine | None:
@@ -435,10 +611,17 @@ def scan_thai_id_from_lines(lines: list[OcrLine]) -> tuple[ScanResponse | None, 
 
 
 def _is_complete(response: ScanResponse) -> bool:
-    """True once nothing further could be gained from trying more rotations."""
+    """True once nothing further could be gained from trying more rotations.
+
+    date_of_birth is deliberately excluded from this check: a missing DOB is almost always a
+    genuine OCR miss (small font, calendar-format ambiguity) rather than an orientation problem,
+    so waiting on it before stopping just buys 3 extra full OCR passes that re-confirm the same
+    miss. Measured on a real fixture image: DOB stayed unreadable across all 4 rotations, so the
+    extra passes cost ~40s and recovered nothing.
+    """
     return response.document_valid and all(
         v is not None
-        for v in (response.first_name, response.last_name, response.date_of_birth, response.sex)
+        for v in (response.first_name, response.last_name, response.sex)
     )
 
 
@@ -514,12 +697,14 @@ def scan_thai_id(image_bytes: bytes) -> tuple[ScanResponse | None, ScanError | N
     if img is None:
         return None, ScanError("image_invalid")
 
-    # Try all 4 cardinal orientations — a card photographed upside-down or sideways otherwise
-    # OCRs as noise. Stops as soon as a rotation reads every field (the common upright case
-    # still costs a single OCR pass); otherwise every rotation tried gets merged field-by-field
-    # so a field missed in one rotation can still be recovered from another.
+    # Try the cardinal orientations — a card photographed upside-down or sideways otherwise OCRs
+    # as noise. A cheap detection pass (~1-4s, against ~17s for a full OCR pass) splits them into
+    # the direction the text actually runs and the perpendicular one. Stops as soon as a rotation
+    # reads every field; otherwise every rotation tried gets merged field-by-field so a field
+    # missed in one rotation can still be recovered from another.
+    preferred, fallback = _rotation_plan(img)
     responses: list[ScanResponse] = []
-    for _deg, rotated in rotations(img):
+    for _deg, rotated in preferred:
         lines = _run_ocr(rotated)
         response, _error = scan_thai_id_from_lines(lines)
         if response is None:
@@ -527,6 +712,21 @@ def scan_thai_id(image_bytes: bytes) -> tuple[ScanResponse | None, ScanError | N
         responses.append(response)
         if _is_complete(response):
             break
+
+    # The perpendicular rotations are worth their OCR passes only when the preferred direction
+    # read nothing at all — that, not the detector's own confidence, is the signal it called the
+    # direction wrong. When the preferred direction did read the card but left fields missing
+    # (a blurred ID number, a card with no legible surname), those fields are unreadable rather
+    # than mis-rotated, and re-OCRing sideways spends two more passes to recover nothing.
+    if not responses:
+        for _deg, rotated in fallback:
+            lines = _run_ocr(rotated)
+            response, _error = scan_thai_id_from_lines(lines)
+            if response is None:
+                continue
+            responses.append(response)
+            if _is_complete(response):
+                break
 
     if not responses:
         return None, ScanError("no_document_detected")

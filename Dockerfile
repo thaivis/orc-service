@@ -33,12 +33,23 @@ COPY requirements.txt .
 # paddlex[ocr] brings opencv-contrib-python==4.10.0.84 and checks for that exact package name at runtime
 # (importlib.metadata), so we keep it instead of substituting the headless variant.
 RUN pip install --no-cache-dir -r requirements.txt
-# PaddleOCR: avoid MKL-DNN in thin containers (can segfault); thread caps reduce allocator issues.
+# PaddleOCR: thread caps reduce allocator issues.
 # Models download on first Thai ID /scan (no RUN warmup — init crashes in some build daemons).
 ENV OMP_NUM_THREADS=1
 ENV OPENBLAS_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
-ENV FLAGS_use_mkldnn=0
+# MKL-DNN (oneDNN) conv kernels: ~20-27% faster per scan (measured: 10 consecutive predict()
+# calls on the mobile det/rec models, 32.3s -> 23.6s avg) with byte-identical output. Previously
+# disabled over segfault worries in slim containers; paddlepaddle is already pinned to 3.2.x for
+# an unrelated oneDNN/PIR regression in 3.3.x (see requirements.txt) — on 3.2.x with these mobile
+# models, MKL-DNN ran crash-free across repeated trials, so there's no reason left to pay for it.
+ENV FLAGS_use_mkldnn=1
+# paddlex's own predictor thread pool ignores the OMP/OPENBLAS/MKL caps above and defaults to 10
+# threads, oversubscribing past the 2-core CPU limit set in docker-compose.yml/k8s (contention,
+# not real parallelism). Capping it to the actual core count measured 2x faster real /scan
+# requests (106s -> 53s on the same image) with byte-identical output — same model, same math,
+# just no thread thrashing. Bump this if the CPU limit elsewhere is ever raised past 2.
+ENV PADDLE_PDX_CPU_NUM_THREADS=2
 
 COPY app/ ./app/
 
