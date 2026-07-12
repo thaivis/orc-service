@@ -1,3 +1,16 @@
+# Fetches the PaddleOCR model weights as plain files over HTTP — no paddle/paddlex import, so
+# it can't repeat the "init crashes in some build daemons" issue that ruled out a RUN warmup
+# below (that came from constructing the actual inference pipeline during build).
+FROM python:3.11-slim AS model_downloader
+RUN pip install --no-cache-dir "huggingface_hub[cli]>=0.28,<1"
+# Must match the models thai_id.py's _get_ocr() pins: PP-OCRv5_mobile_det/th_PP-OCRv5_mobile_rec
+# explicitly, plus PP-LCNet_x1_0_textline_ori for use_textline_orientation=True. Destination path
+# matches paddlex's own default cache layout (~/.paddlex/official_models/<model>), so PaddleOCR()
+# finds them already present at runtime instead of downloading.
+RUN for model in PP-LCNet_x1_0_textline_ori PP-OCRv5_mobile_det th_PP-OCRv5_mobile_rec; do \
+        hf download "PaddlePaddle/${model}" --local-dir "/root/.paddlex/official_models/${model}"; \
+    done
+
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -34,7 +47,10 @@ COPY requirements.txt .
 # (importlib.metadata), so we keep it instead of substituting the headless variant.
 RUN pip install --no-cache-dir -r requirements.txt
 # PaddleOCR: thread caps reduce allocator issues.
-# Models download on first Thai ID /scan (no RUN warmup — init crashes in some build daemons).
+# Model weights are baked in by the model_downloader stage below (COPY, not a RUN warmup —
+# constructing PaddleOCR() during build crashed some build daemons). Skip the runtime
+# connectivity check to the model hosters since the files are already on disk.
+ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 ENV OMP_NUM_THREADS=1
 ENV OPENBLAS_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
@@ -57,6 +73,7 @@ ENV PADDLE_PDX_CPU_NUM_THREADS=2
 # honors — confirmed it drops the subprocess to 1 thread. Keep in sync with PADDLE_PDX_CPU_NUM_THREADS.
 ENV OMP_THREAD_LIMIT=2
 
+COPY --from=model_downloader /root/.paddlex/official_models /root/.paddlex/official_models
 COPY app/ ./app/
 
 ENV PYTHONUNBUFFERED=1
