@@ -69,7 +69,8 @@
       "Read(//c/Users/skitt/**)",
       "Bash(python -m pip install --quiet --no-cache-dir \"paddlepaddle==2.6.2\")",
       "Bash(python -c \"import paddle; print\\('paddle', paddle.__version__\\)\")",
-      "Bash(python -m pytest tests/)"
+      "Bash(python -m pytest tests/)",
+      "Bash(git add *)"
     ]
   }
 }

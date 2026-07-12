@@ -30,17 +30,31 @@ def _get_detector():
 def _extract_mrz_lines(raw_mrz_text: str) -> tuple[str, str] | None:
     lines = [line for line in raw_mrz_text.split("\n") if line.strip()]
     candidates = [line.strip() for line in lines if "<" in line and len(line.strip()) >= 30]
-    if len(candidates) < 2:
-        return None
-    line1, line2 = candidates[-2], candidates[-1]
-    if line1 == line2:
+    pairs = [
+        (candidates[i], candidates[i + 1])
+        for i in range(len(candidates) - 1)
+        if candidates[i] != candidates[i + 1]
+    ]
+    if not pairs:
         # A genuine TD3 line 2 always differs from line 1 — it encodes document number, date of
         # birth, expiry, and checksums, never the name. Identical lines mean the source printed
         # (or a crop/OCR artifact duplicated) the same text twice, e.g. a mockup/specimen graphic
         # with no real second line — so document_number/date_of_birth/sex can't be trusted from
         # it even if it happens to satisfy a checksum or two by coincidence.
         return None
-    return line1, line2
+
+    best_pair: tuple[str, str] | None = None
+    best_rank = (-1, -1)
+    for line1, line2 in pairs:
+        realigned_line2 = _realign_line2(line2)
+        parsed = parse_td3(_normalize_doc_type(_pad_mrz(line1)), realigned_line2)
+        if parsed is None or parsed.document_number is None:
+            continue
+        rank = (int(parsed.valid), sum(td3_line2_checks(realigned_line2)))
+        if rank > best_rank:
+            best_pair = (line1, line2)
+            best_rank = rank
+    return best_pair if best_pair is not None else pairs[-1]
 
 
 def _normalize_doc_type(line1: str) -> str:
@@ -487,36 +501,61 @@ def scan_passport(image_bytes: bytes) -> tuple[ScanResponse | None, ScanError | 
     fallback_score = -1
 
     # Pass 1: fastmrz on the preprocessed image (locates + OCRs the MRZ band; fast when it works).
-    # Pass 2: direct Tesseract MRZ OCR on the *raw* image — recovers scans where fastmrz's ROI
-    #   detector finds nothing. Raw (not preprocessed) because CLAHE/warp can smear a clean MRZ.
-    # Keep the best-scoring fallback across every pass/rotation (not just the first one found) —
+    # Pass 2: direct Tesseract MRZ OCR on the preprocessed image — recovers screenshots/PDF
+    #   previews where document cropping removes toolbar/background text that otherwise pollutes
+    #   whole-frame OCR.
+    # Pass 3: direct Tesseract MRZ OCR on the *raw* image — recovers clean scans where CLAHE/warp
+    #   smears the MRZ.
+    # Try each pass in the same orientation before rotating. Upright phone/PDF captures are common,
+    # and a successful direct preprocessed read is both faster and cleaner than exhausting every
+    # rotated raw fallback first. Keep the best-scoring fallback across every pass/rotation —
     # an earlier pass can land a low-confidence misaligned read (e.g. nationality "THA" -> "2TH")
     # before a later pass/rotation recovers the correctly-aligned line.
-    for source, parser in ((img, lambda r: _try_parse(detector, r)), (raw, _try_parse_direct)):
-        if source is None:
-            continue
-        for _deg, rotated in rotations(source):
-            result = parser(rotated)
-            if result is None:
+    parse_sources = [
+        (img, (lambda r: _try_parse(detector, r), _try_parse_direct)),
+        (raw, (_try_parse_direct,)),
+    ]
+    rotation_batches = [
+        (rotations(source), parsers)
+        for source, parsers in parse_sources
+        if source is not None
+    ]
+    max_rotations = max((len(rotated_source) for rotated_source, _parsers in rotation_batches), default=0)
+    for i in range(max_rotations):
+        for rotated_source, parsers in rotation_batches:
+            if i >= len(rotated_source):
                 continue
-            parsed, checks, name_conf = result
-            if parsed.valid:
-                return _fill_sex_from_visual_zone(_to_response(parsed, checks, name_conf), raw), None
-            score = sum(checks)
-            if score > fallback_score:
-                fallback, fallback_checks, fallback_name_conf, fallback_score = parsed, checks, name_conf, score
+            _deg, rotated = rotated_source[i]
+            for parser in parsers:
+                result = parser(rotated)
+                if result is None:
+                    continue
+                parsed, checks, name_conf = result
+                if parsed.valid:
+                    return _fill_sex_from_visual_zone(_to_response(parsed, checks, name_conf), raw), None
+                score = sum(checks)
+                if score > fallback_score:
+                    fallback, fallback_checks, fallback_name_conf, fallback_score = parsed, checks, name_conf, score
 
     if fallback is not None and fallback_score >= _MIN_FALLBACK_SCORE:
         response = _to_response(fallback, fallback_checks, fallback_name_conf)
         return _fill_sex_from_visual_zone(response, raw), None
 
-    # Pass 3: no full MRZ parse — salvage name + nationality from a clean line 1 (line 2
-    # missing/redacted) so we still return what's legible instead of a bare 422.
-    for _deg, rotated in rotations(raw):
-        result = _try_parse_line1(rotated)
-        if result is not None:
-            parsed, name_conf = result
-            return _fill_sex_from_visual_zone(_to_response(parsed, None, name_conf), raw), None
+    # Pass 4: no full MRZ parse — salvage name + nationality from a clean line 1 (line 2
+    # missing/redacted) so we still return what's legible instead of a bare 422. Prefer the
+    # preprocessed crop before raw for screenshots/PDF previews with viewer UI around the document.
+    line1_sources = [source for source in (img, raw) if source is not None]
+    line1_rotation_batches = [rotations(source) for source in line1_sources]
+    max_line1_rotations = max((len(rotated_source) for rotated_source in line1_rotation_batches), default=0)
+    for i in range(max_line1_rotations):
+        for rotated_source in line1_rotation_batches:
+            if i >= len(rotated_source):
+                continue
+            _deg, rotated = rotated_source[i]
+            result = _try_parse_line1(rotated)
+            if result is not None:
+                parsed, name_conf = result
+                return _fill_sex_from_visual_zone(_to_response(parsed, None, name_conf), raw), None
 
     return None, ScanError("no_document_detected")
 
