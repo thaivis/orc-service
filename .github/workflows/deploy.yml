@@ -12,6 +12,7 @@ on:
         description: 'Image tag to deploy (e.g. sha-abc1234, v1.2.3, main)'
         required: true
         type: string
+        default: 'main'
 
 concurrency:
   group: deploy-production
