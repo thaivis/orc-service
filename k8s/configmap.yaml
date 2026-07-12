@@ -1,0 +1,11 @@
+# ConfigMap: non-secret runtime config (mirrors .env.example)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orc-service-config
+  namespace: production
+data:
+  PORT: "8000"
+  MAX_IMAGE_SIZE_MB: "10"
+  MAX_IMAGE_DIMENSION: "2000"
+  LOG_LEVEL: "info"

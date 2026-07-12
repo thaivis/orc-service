@@ -1,0 +1,78 @@
+name: deploy-production
+
+# Manually bump the production image tag:
+#   1. verify the tag exists in ghcr.io/thaivis/orc-service
+#   2. edit k8s/deployment.yaml, apply it, wait for rollout
+#   3. only on a successful rollout, commit the edit back to main
+#      (a failed rollout leaves main pointing at the last-good tag)
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (e.g. sha-abc1234, v1.2.3, main)'
+        required: true
+        type: string
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  deploy:
+    runs-on: self-hosted-thaivis
+    environment: production
+    env:
+      IMAGE: ghcr.io/thaivis/orc-service
+      IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify image tag exists in GHCR
+        run: |
+          set -euo pipefail
+          RESP=$(curl -sf -u "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:thaivis/orc-service:pull")
+          TOKEN=$(echo "$RESP" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Failed to obtain a GHCR auth token"
+            exit 1
+          fi
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/thaivis/orc-service/manifests/${IMAGE_TAG}")
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::${IMAGE}:${IMAGE_TAG} not found in GHCR (HTTP ${STATUS})"
+            exit 1
+          fi
+
+      - name: Set image tag in k8s/deployment.yaml
+        run: |
+          set -euo pipefail
+          sed -i -E "s#(image: ghcr\.io/thaivis/orc-service):.*#\1:${IMAGE_TAG}#" k8s/deployment.yaml
+          grep -q "image: ${IMAGE}:${IMAGE_TAG}" k8s/deployment.yaml
+
+      - name: Apply Deployment
+        run: kubectl apply -f k8s/deployment.yaml
+
+      - name: Wait for rollout
+        run: kubectl -n production rollout status deploy/orc-service --timeout=360s
+
+      - name: Commit and push image tag bump
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git rebase origin/main
+          git add k8s/deployment.yaml
+          if git diff --cached --quiet; then
+            echo "k8s/deployment.yaml already up to date on main, nothing to commit"
+            exit 0
+          fi
+          git commit -m "deploy: ${IMAGE}:${IMAGE_TAG} to production"
+          git push origin HEAD:main

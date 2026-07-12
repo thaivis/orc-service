@@ -129,7 +129,17 @@ export class OcrService {
 
 ## Kubernetes Deployment
 
-Manifest หลักอยู่ที่ `k8s/deployment.yaml` และตั้ง namespace เป็น `production` แล้ว ไฟล์นี้ deploy `ConfigMap`, `Deployment`, `Service`, `HPA`, และ `NetworkPolicy` แต่ไม่เก็บ production secret จริงไว้ใน git
+Manifest แยกเป็นไฟล์ตาม resource อยู่ใต้ `k8s/`: `configmap.yaml`, `deployment.yaml`, `service.yaml`, `hpa.yaml`, `networkpolicy.yaml` ทุกไฟล์ตั้ง namespace เป็น `production` แล้ว แต่ไม่เก็บ production secret จริงไว้ใน git
+
+### Bump image tag ผ่าน GitHub Action (วิธีปกติ)
+
+Workflow `.github/workflows/deploy.yml` ทำ deploy image ตัวใหม่ให้ทั้งหมด: Actions → `deploy-production` → Run workflow → ใส่ `image_tag` (เช่น `sha-abc1234`, `v1.2.3`)
+
+Workflow จะ verify ว่า tag มีอยู่จริงใน GHCR, แก้ image tag ใน `k8s/deployment.yaml`, apply แล้วรอ rollout — **commit กลับเข้า `main` เฉพาะตอน rollout สำเร็จเท่านั้น** ถ้า rollout fail จะไม่มี commit เกิดขึ้น เพื่อให้ `main` ตรงกับสิ่งที่ production รันอยู่เสมอ รันบน self-hosted runner (`self-hosted-thaivis`) ที่ตั้ง kubeconfig เข้าถึง `production` ไว้แล้ว
+
+Workflow นี้ apply แค่ `k8s/deployment.yaml` เท่านั้น — ถ้าแก้ `configmap.yaml`, `service.yaml`, `hpa.yaml`, หรือ `networkpolicy.yaml` ต้อง apply เองด้วยมือตามขั้นตอนด้านล่าง
+
+### Manual deploy / แก้ resource อื่นที่ไม่ใช่ image bump
 
 ### 1. Build และ push image
 
@@ -180,8 +190,8 @@ imagePullSecrets:
 ก่อน apply production ให้ดู diff ก่อน โดยเฉพาะ `Service` port และ `NetworkPolicy`:
 
 ```bash
-kubectl diff -f k8s/deployment.yaml
-kubectl apply -f k8s/deployment.yaml
+kubectl diff -f k8s/
+kubectl apply -f k8s/
 ```
 
 ตาม rollout:

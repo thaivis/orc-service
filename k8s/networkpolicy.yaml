@@ -1,0 +1,22 @@
+# NetworkPolicy: อนุญาตเฉพาะ pods ใน namespace เดียวกัน (production) เท่านั้น
+# ที่จะเรียกเข้ามาที่ orc-service ได้ — บล็อก ingress จากภายนอก namespace ทั้งหมด
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orc-service-allow-same-namespace
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: orc-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+      ports:
+        - protocol: TCP
+          port: 8000
