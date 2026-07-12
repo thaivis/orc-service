@@ -5,6 +5,7 @@ import uuid
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
 from app.logging_config import configure_logging, request_id_var
@@ -152,7 +153,7 @@ async def scan_thai_id_card(
 
     from app.scanners.thai_id import scan_thai_id
 
-    result, err = scan_thai_id(contents)
+    result, err = await run_in_threadpool(scan_thai_id, contents)
     return _handle_scan_result(result, err, "No Thai ID detected in image")
 
 
@@ -172,7 +173,7 @@ async def scan_passport_document(
 
     from app.scanners.passport import scan_passport
 
-    result, err = scan_passport(contents)
+    result, err = await run_in_threadpool(scan_passport, contents)
     return _handle_scan_result(result, err, "No MRZ detected in image")
 
 
