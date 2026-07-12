@@ -179,6 +179,15 @@ _VALID_LINE1 = "P<UTOERIKSSON<<ANNA<MARIA<<<<<<<<<<<<<<<<<<<"
 _VALID_LINE2 = "L898902C36UTO7408122F1204159ZE184226B<<<<<10"
 
 
+def test_extract_mrz_lines_prefers_parseable_pair_over_later_noise():
+    """Whole-frame OCR can emit extra MRZ-looking garbage after the real two TD3 lines. The
+    parser must choose the valid adjacent TD3 pair, not blindly take the final two candidates."""
+    noise = "AHARRR0989<AVYYV00M000000B00N00S0S0288<"
+    text = "\n".join(["PASSPORTTRTP0C00<C2P0N0SN0BQZ0", _VALID_LINE1, _VALID_LINE2, noise])
+
+    assert passport_module._extract_mrz_lines(text) == (_VALID_LINE1, _VALID_LINE2)
+
+
 class _FakeDetector:
     def __init__(self, raw_text: str):
         self._raw_text = raw_text
@@ -300,3 +309,41 @@ def test_scan_passport_accepts_fallback_at_min_score(monkeypatch):
 
     assert err is None
     assert result.document_number == "MITBTTSE"
+
+
+def test_scan_passport_tries_preprocessed_direct_ocr_before_raw_rotations(monkeypatch):
+    """PDF-preview screenshots can only read cleanly after document crop/perspective correction.
+    Direct OCR on that preprocessed upright image should get a chance before slower raw/rotated
+    fallbacks pollute the candidate pool with viewer UI and surrounding text."""
+    parsed = MrzParsed(
+        document_number="L898902C3", surname="ERIKSSON", given_names="ANNA MARIA",
+        nationality="UTO", date_of_birth_iso="1974-08-12", sex="F", valid=True,
+    )
+    direct_calls = []
+
+    monkeypatch.setattr(passport_module, "preprocess", lambda b: "IMG")
+    monkeypatch.setattr(passport_module, "decode_image", lambda b: "RAW")
+    monkeypatch.setattr(passport_module, "normalize_size", lambda r: r)
+    monkeypatch.setattr(passport_module, "_get_detector", lambda: None)
+    monkeypatch.setattr(
+        passport_module,
+        "rotations",
+        lambda src: [(0, src), (90, f"{src}-90"), (180, f"{src}-180"), (270, f"{src}-270")],
+    )
+    monkeypatch.setattr(passport_module, "_try_parse", lambda detector, img: None)
+
+    def fake_direct(img):
+        direct_calls.append(img)
+        if img == "IMG":
+            return parsed, (True, True, True, True, True), 0.9
+        return None
+
+    monkeypatch.setattr(passport_module, "_try_parse_direct", fake_direct)
+    monkeypatch.setattr(passport_module, "_fill_sex_from_visual_zone", lambda response, raw: response)
+
+    result, err = passport_module.scan_passport(b"fake")
+
+    assert err is None
+    assert result.document_number == "L898902C3"
+    assert result.first_name == "ANNA"
+    assert direct_calls == ["IMG"]
