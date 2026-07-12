@@ -90,8 +90,6 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
-            - name: paddle-cache
-              mountPath: /root/.paddlex
             - name: paddleocr-cache
               mountPath: /root/.paddleocr
       volumes:
@@ -99,11 +97,6 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 256Mi
-        # Per-pod cache for PaddleOCR model downloads. Swap to a PVC if you
-        # want models to persist across pod restarts.
-        - name: paddle-cache
-          emptyDir:
-            sizeLimit: 1Gi
         - name: paddleocr-cache
           emptyDir:
             sizeLimit: 1Gi
