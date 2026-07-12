@@ -59,6 +59,10 @@ def test_thai_id_checksum_rejects_non_digit():
     assert not thai_id_checksum("123")
 
 
+def test_thai_id_checksum_rejects_unicode_digits():
+    assert not thai_id_checksum("๑๑๐๑๗๐๐๑๕๗๖๔๖")
+
+
 def test_mrz_dob_to_iso_future_date_rejected():
     # If today is 2026-04-25, "260601" (Jun 2026) is in the future → reject
     today = date.today()

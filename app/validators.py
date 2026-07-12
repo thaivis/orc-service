@@ -43,7 +43,7 @@ def mrz_dob_to_iso(yymmdd: str) -> str | None:
 
 def thai_id_checksum(id_str: str) -> bool:
     """Verify Thai national ID 13-digit mod-11 checksum."""
-    if len(id_str) != 13 or not id_str.isdigit():
+    if len(id_str) != 13 or not id_str.isascii() or not id_str.isdigit():
         return False
     total = sum(int(id_str[i]) * (13 - i) for i in range(12))
     check = (11 - (total % 11)) % 10

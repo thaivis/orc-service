@@ -45,6 +45,23 @@ def _get_ocr():
 
 _det_cache: tuple | None = None
 
+_DIGIT_TRANSLATION = str.maketrans({
+    "๐": "0",
+    "๑": "1",
+    "๒": "2",
+    "๓": "3",
+    "๔": "4",
+    "๕": "5",
+    "๖": "6",
+    "๗": "7",
+    "๘": "8",
+    "๙": "9",
+})
+
+
+def _ascii_digits(text: str) -> str:
+    return text.translate(_DIGIT_TRANSLATION)
+
 
 def _detect_boxes(img: np.ndarray):
     """Detected text boxes for `img`, reusing the previous result when it's the very same array.
@@ -235,6 +252,65 @@ def _run_ocr(img: np.ndarray) -> list[OcrLine]:
     return lines
 
 
+def _run_tesseract_ocr(img: np.ndarray) -> list[OcrLine]:
+    """English-oriented fallback for low-res Thai IDs whose Latin fields are clearer than Thai.
+
+    Paddle's Thai mobile recognizer can collapse small, compressed mixed Thai/English ID cards
+    into high-confidence symbol garbage. Tesseract's English model reads the Latin labels, names,
+    DOB, and Arabic-digit ID groups on those cards well enough to recover the API fields. Kept as
+    a fallback so normal Paddle reads stay on the faster tuned path.
+    """
+    import cv2
+    import pytesseract
+
+    scaled = cv2.resize(
+        img,
+        (img.shape[1] * 2, img.shape[0] * 2),
+        interpolation=cv2.INTER_CUBIC,
+    )
+    gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+    data = pytesseract.image_to_data(
+        gray,
+        lang="eng",
+        config="--psm 6",
+        output_type=pytesseract.Output.DICT,
+    )
+
+    grouped: dict[tuple[int, int, int], list[int]] = {}
+    order: list[tuple[int, int, int]] = []
+    for i, text in enumerate(data["text"]):
+        if not text.strip():
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except ValueError:
+            continue
+        if conf <= 0:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(i)
+
+    lines: list[OcrLine] = []
+    for key in order:
+        idxs = grouped[key]
+        text = " ".join(data["text"][i].strip() for i in idxs)
+        confs = [float(data["conf"][i]) / 100.0 for i in idxs if float(data["conf"][i]) > 0]
+        left = min(float(data["left"][i]) for i in idxs) / 2.0
+        top = min(float(data["top"][i]) for i in idxs) / 2.0
+        right = max(float(data["left"][i] + data["width"][i]) for i in idxs) / 2.0
+        bottom = max(float(data["top"][i] + data["height"][i]) for i in idxs) / 2.0
+        lines.append(OcrLine(
+            text=text,
+            confidence=sum(confs) / len(confs) if confs else 0.0,
+            cx=(left + right) / 2.0,
+            cy=(top + bottom) / 2.0,
+        ))
+    return lines
+
+
 def _find_below(anchor: OcrLine, lines: list[OcrLine], max_dx: float = 100.0) -> OcrLine | None:
     candidates = [
         ln for ln in lines if ln.cy > anchor.cy + 1 and abs(ln.cx - anchor.cx) < max_dx
@@ -255,29 +331,44 @@ def extract_id_number(lines: list[OcrLine]) -> tuple[str | None, float, bool]:
     fallback: tuple[str, float] | None = None
     # Fast path: one line already contains all 13 digits.
     for line in lines:
-        digits = re.sub(r"\D", "", line.text)
+        digits = re.sub(r"[^0-9]", "", _ascii_digits(line.text))
         if len(digits) == 13:
             if thai_id_checksum(digits):
                 return digits, line.confidence, True
             if fallback is None:
                 fallback = (digits, line.confidence)
-    # Fragmented path: concatenate consecutive digit runs and accept the first checksum-valid
-    # 13-digit window. The checksum gates against false joins (dates, card/laser numbers).
-    runs: list[tuple[str, float]] = [
-        (m.group(), line.confidence)
-        for line in lines
-        for m in re.finditer(r"\d+", line.text)
-    ]
-    for i in range(len(runs)):
-        joined = ""
-        confs: list[float] = []
-        for digits, conf in runs[i:]:
-            joined += digits
-            confs.append(conf)
-            if len(joined) >= 13:
-                if len(joined) == 13 and thai_id_checksum(joined):
-                    return joined, sum(confs) / len(confs), True
-                break
+
+    # Fragmented path: concatenate digit runs on the same OCR row only. The old implementation
+    # walked every digit run in page order, which let dates/laser numbers from unrelated rows
+    # accidentally combine into a checksum-valid 13-digit value.
+    indexed = list(enumerate(lines))
+    tol = _row_tol(lines)
+    indexed.sort(key=lambda item: (item[1].cy, item[1].cx, item[0]))
+    rows: list[list[tuple[int, OcrLine]]] = []
+    for item in indexed:
+        _idx, line = item
+        if not rows or abs(line.cy - rows[-1][0][1].cy) > tol:
+            rows.append([item])
+        else:
+            rows[-1].append(item)
+
+    for row in rows:
+        runs: list[tuple[str, float]] = []
+        for _idx, line in sorted(row, key=lambda item: (item[1].cx, item[0])):
+            runs.extend(
+                (m.group(), line.confidence)
+                for m in re.finditer(r"[0-9]+", _ascii_digits(line.text))
+            )
+        for i in range(len(runs)):
+            joined = ""
+            confs: list[float] = []
+            for digits, conf in runs[i:]:
+                joined += digits
+                confs.append(conf)
+                if len(joined) >= 13:
+                    if len(joined) == 13 and thai_id_checksum(joined):
+                        return joined, sum(confs) / len(confs), True
+                    break
     if fallback is not None:
         return fallback[0], fallback[1], False
     return None, 0.0, False
@@ -464,7 +555,7 @@ TH_MONTHS = {
     "ธ.ค.": 12, "ธ.ค": 12, "ธันวาคม": 12,
 }
 
-DATE_EN_RE = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3,})\.?\s+(\d{4})\b")
+DATE_EN_RE = re.compile(r"\b(\d{1,2})\s*([A-Za-z]{3,})\.?\s+(\d{4})\b")
 
 
 def _be_to_ce(year: int) -> int:
@@ -625,6 +716,19 @@ def _is_complete(response: ScanResponse) -> bool:
     )
 
 
+def _supporting_field_count(response: ScanResponse) -> int:
+    """How much non-ID evidence this rotation read from the card.
+
+    A random 13-digit run can pass the Thai checksum by chance, especially when OCR is pointed at
+    the wrong rotation and sees dates/laser numbers as noise. Names, DOB, and title-derived sex
+    are independent evidence that the rotation actually read the card face.
+    """
+    return sum(
+        v is not None
+        for v in (response.first_name, response.last_name, response.date_of_birth, response.sex)
+    )
+
+
 def _merge_rotation_reads(responses: list[ScanResponse]) -> ScanResponse:
     """Combine reads from multiple rotations of the same physical card, keeping the
     highest-confidence value for each field independently.
@@ -645,7 +749,11 @@ def _merge_rotation_reads(responses: list[ScanResponse]) -> ScanResponse:
         id_agreement[r.document_number] = id_agreement.get(r.document_number, 0) + 1
     id_source = max(
         id_pool,
-        key=lambda r: (id_agreement[r.document_number], r.confidence.document_number),
+        key=lambda r: (
+            id_agreement[r.document_number],
+            _supporting_field_count(r),
+            r.confidence.document_number,
+        ),
     )
 
     def pick(field: str, conf_field: str) -> tuple[object | None, float]:
@@ -697,13 +805,25 @@ def scan_thai_id(image_bytes: bytes) -> tuple[ScanResponse | None, ScanError | N
     if img is None:
         return None, ScanError("image_invalid")
 
+    responses: list[ScanResponse] = []
+
+    # Cheap first pass: many Thai IDs expose the API fields in Latin text. If Tesseract reads a
+    # complete, checksum-valid card, skip Paddle entirely (and avoid model cold-start cost).
+    for _deg, rotated in rotations(img):
+        lines = _run_tesseract_ocr(rotated)
+        response, _error = scan_thai_id_from_lines(lines)
+        if response is None:
+            continue
+        responses.append(response)
+        if _is_complete(response):
+            return response, None
+
     # Try the cardinal orientations — a card photographed upside-down or sideways otherwise OCRs
     # as noise. A cheap detection pass (~1-4s, against ~17s for a full OCR pass) splits them into
     # the direction the text actually runs and the perpendicular one. Stops as soon as a rotation
     # reads every field; otherwise every rotation tried gets merged field-by-field so a field
     # missed in one rotation can still be recovered from another.
     preferred, fallback = _rotation_plan(img)
-    responses: list[ScanResponse] = []
     for _deg, rotated in preferred:
         lines = _run_ocr(rotated)
         response, _error = scan_thai_id_from_lines(lines)
@@ -713,12 +833,11 @@ def scan_thai_id(image_bytes: bytes) -> tuple[ScanResponse | None, ScanError | N
         if _is_complete(response):
             break
 
-    # The perpendicular rotations are worth their OCR passes only when the preferred direction
-    # read nothing at all — that, not the detector's own confidence, is the signal it called the
-    # direction wrong. When the preferred direction did read the card but left fields missing
-    # (a blurred ID number, a card with no legible surname), those fields are unreadable rather
-    # than mis-rotated, and re-OCRing sideways spends two more passes to recover nothing.
-    if not responses:
+    # The perpendicular rotations are worth their OCR passes when the preferred direction read
+    # nothing, or when it only produced a bare checksum-valid number with no independent fields.
+    # That bare-number case is exactly how a wrong rotation can turn dates/laser digits into a
+    # confident-looking but wrong document_number.
+    if not responses or not any(_supporting_field_count(r) > 0 for r in responses):
         for _deg, rotated in fallback:
             lines = _run_ocr(rotated)
             response, _error = scan_thai_id_from_lines(lines)

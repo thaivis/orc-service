@@ -39,6 +39,17 @@ def test_extract_id_number_strips_separators_and_validates():
     assert conf == 0.95
 
 
+def test_extract_id_number_normalizes_thai_digits_to_ascii():
+    valid = _valid_id()
+    thai_digits = str.maketrans("0123456789", "๐๑๒๓๔๕๖๗๘๙")
+    text = valid.translate(thai_digits)
+
+    id_str, _conf, ok = extract_id_number([OcrLine(text=text, confidence=0.95)])
+
+    assert id_str == valid
+    assert ok is True
+
+
 def test_extract_id_number_prefers_checksum_valid_over_invalid():
     valid = _valid_id()
     invalid = _invalid_id()
@@ -60,6 +71,22 @@ def test_extract_id_number_falls_back_to_invalid_checksum():
 
 def test_extract_id_number_returns_none_when_no_13_digit_run():
     id_str, conf, ok = extract_id_number([OcrLine(text="hello world", confidence=0.9)])
+    assert id_str is None
+    assert conf == 0.0
+    assert ok is False
+
+
+def test_extract_id_number_does_not_join_digits_across_rows():
+    """Dates, laser numbers, and addresses can each contribute digit groups. A checksum-valid
+    value assembled across different OCR rows is not the ID-number field."""
+    valid = _valid_id()
+    lines = [
+        OcrLine(text=valid[:6], confidence=0.95, cx=100, cy=10),
+        OcrLine(text=valid[6:], confidence=0.95, cx=100, cy=80),
+    ]
+
+    id_str, conf, ok = extract_id_number(lines)
+
     assert id_str is None
     assert conf == 0.0
     assert ok is False
@@ -163,6 +190,12 @@ def test_extract_first_name_returns_none_when_absent():
 def test_extract_dob_english_format():
     d, conf = extract_dob([OcrLine(text="Date of Birth 1 Jan. 1990", confidence=0.9)])
     assert d == date(1990, 1, 1)
+    assert conf == 0.9
+
+
+def test_extract_dob_english_format_without_space_between_day_and_month():
+    d, conf = extract_dob([OcrLine(text="Date of Birth 2May 1990", confidence=0.9)])
+    assert d == date(1990, 5, 2)
     assert conf == 0.9
 
 
@@ -272,6 +305,7 @@ def test_scan_thai_id_recovers_via_rotation(monkeypatch):
         thai_id_module, "_run_ocr",
         lambda rotated: good_lines if rotated == "r180" else [],
     )
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated: [])
 
     result, err = scan_thai_id(b"fake-bytes")
     assert err is None
@@ -302,6 +336,7 @@ def test_scan_thai_id_short_circuits_on_first_complete_rotation(monkeypatch):
         calls.append(rotated)
         return good_lines
 
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated: [])
     monkeypatch.setattr(thai_id_module, "_run_ocr", fake_run_ocr)
 
     result, err = scan_thai_id(b"fake-bytes")
@@ -314,6 +349,7 @@ def test_scan_thai_id_returns_no_document_when_all_rotations_fail(monkeypatch):
     monkeypatch.setattr(thai_id_module, "preprocess", lambda image_bytes: "preprocessed")
     monkeypatch.setattr(thai_id_module, "rotations", lambda img: [(0, "r0"), (180, "r180")])
     monkeypatch.setattr(thai_id_module, "_run_ocr", lambda rotated: [])
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated: [])
 
     result, err = scan_thai_id(b"fake-bytes")
     assert result is None
@@ -348,6 +384,7 @@ def test_scan_thai_id_merges_fields_across_rotations(monkeypatch):
         thai_id_module, "_run_ocr",
         lambda rotated: {"r0": r0_lines, "r90": r90_lines}.get(rotated, []),
     )
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated: [])
 
     result, err = scan_thai_id(b"fake-bytes")
     assert err is None
@@ -386,8 +423,77 @@ def test_scan_thai_id_prefers_id_number_multiple_rotations_agree_on(monkeypatch)
         thai_id_module, "_run_ocr",
         lambda rotated: lines_by_rotation.get(rotated, []),
     )
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated: [])
 
     result, err = scan_thai_id(b"fake-bytes")
     assert err is None
     assert result is not None
     assert result.document_number == correct
+
+
+def test_scan_thai_id_tries_fallback_when_preferred_reads_only_bare_id(monkeypatch):
+    """A wrong orientation can hallucinate a checksum-valid number from unrelated digits. If the
+    preferred orientation reads no name/DOB/sex, scan the fallback orientations before trusting it."""
+    correct = _valid_id()
+    other_base = "110170015765"
+    other_total = sum(int(other_base[i]) * (13 - i) for i in range(12))
+    wrong = other_base + str((11 - (other_total % 11)) % 10)
+    assert wrong != correct
+
+    preferred_lines = [OcrLine(text=wrong, confidence=1.0)]
+    fallback_lines = [
+        OcrLine(text=correct, confidence=0.9),
+        OcrLine(text="Name Mr. SOMCHAI", confidence=0.95),
+        OcrLine(text="Last name JAIDEE", confidence=0.94),
+        OcrLine(text="Date of Birth 1 Jan. 1990", confidence=0.93),
+    ]
+
+    monkeypatch.setattr(thai_id_module, "preprocess", lambda image_bytes: "preprocessed")
+    monkeypatch.setattr(thai_id_module, "rotations", lambda img: [(0, "r0"), (90, "r90")])
+    monkeypatch.setattr(thai_id_module, "_rotation_plan", lambda img: ([(0, "r0")], [(90, "r90")]))
+    monkeypatch.setattr(
+        thai_id_module,
+        "_run_ocr",
+        lambda rotated: {"r0": preferred_lines, "r90": fallback_lines}.get(rotated, []),
+    )
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated: [])
+
+    result, err = scan_thai_id(b"fake-bytes")
+
+    assert err is None
+    assert result is not None
+    assert result.document_number == correct
+    assert result.first_name == "SOMCHAI"
+    assert result.last_name == "JAIDEE"
+
+
+def test_scan_thai_id_uses_tesseract_when_paddle_reads_no_supported_fields(monkeypatch):
+    valid = _valid_id()
+    tesseract_lines = [
+        OcrLine(text=f"Identification Number {valid}", confidence=0.9),
+        OcrLine(text="Name Mr. SOMCHAI", confidence=0.95),
+        OcrLine(text="Last name JAIDEE", confidence=0.94),
+        OcrLine(text="Date of Birth 2May 1990", confidence=0.93),
+    ]
+    calls: list[str] = []
+
+    monkeypatch.setattr(thai_id_module, "preprocess", lambda image_bytes: "preprocessed")
+    monkeypatch.setattr(thai_id_module, "rotations", lambda img: [(0, "r0"), (90, "r90")])
+    monkeypatch.setattr(thai_id_module, "_rotation_plan", lambda img: ([(0, "r0")], [(90, "r90")]))
+    monkeypatch.setattr(thai_id_module, "_run_ocr", lambda rotated: [])
+
+    def fake_tesseract(rotated):
+        calls.append(rotated)
+        return tesseract_lines if rotated == "r0" else []
+
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", fake_tesseract)
+
+    result, err = scan_thai_id(b"fake-bytes")
+
+    assert err is None
+    assert result is not None
+    assert calls == ["r0"]
+    assert result.document_number == valid
+    assert result.first_name == "SOMCHAI"
+    assert result.last_name == "JAIDEE"
+    assert result.date_of_birth == date(1990, 5, 2)
