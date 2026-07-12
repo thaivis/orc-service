@@ -127,6 +127,95 @@ export class OcrService {
 
 ---
 
+## Kubernetes Deployment
+
+Manifest หลักอยู่ที่ `k8s/deployment.yaml` และตั้ง namespace เป็น `production` แล้ว ไฟล์นี้ deploy `ConfigMap`, `Deployment`, `Service`, `HPA`, และ `NetworkPolicy` แต่ไม่เก็บ production secret จริงไว้ใน git
+
+### 1. Build และ push image
+
+ตั้ง image tag ใน `k8s/deployment.yaml` ให้ตรงกับ image ที่ push แล้ว เช่น:
+
+```yaml
+image: ghcr.io/thaivis/orc-service:sha-06dbcba
+```
+
+ถ้า image เป็น private ต้องให้ Kubernetes มี pull secret ที่อ่าน `ghcr.io/thaivis/orc-service` ได้
+
+### 2. สร้าง runtime API key secret
+
+`API_KEY` ใช้สำหรับ NestJS เรียก orc-service อย่า commit key จริงลง git:
+
+```bash
+kubectl -n production create secret generic orc-service-secrets \
+  --from-literal=API_KEY='<shared-api-key>' \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+### 3. สร้าง GHCR pull secret
+
+ใช้ GitHub account ที่มีสิทธิ์อ่าน package `ghcr.io/thaivis/orc-service` สร้าง GitHub Personal Access Token ที่มี scope `read:packages` ถ้า org `thaivis` เปิด SSO ต้อง authorize token กับ org ด้วย
+
+อย่าพิมพ์ token ตรง ๆ ลง command line หรือแชต ถ้า token หลุด ให้ revoke ทันทีแล้วสร้างใหม่:
+
+```bash
+read -s GHCR_TOKEN
+kubectl -n production create secret docker-registry orc-service-ghcr-pull \
+  --docker-server=ghcr.io \
+  --docker-username='<github-username-with-thaivis-access>' \
+  --docker-password="$GHCR_TOKEN" \
+  --docker-email='<email>' \
+  --dry-run=client -o yaml | kubectl apply -f -
+unset GHCR_TOKEN
+```
+
+Deployment ต้องอ้าง secret นี้:
+
+```yaml
+imagePullSecrets:
+  - name: orc-service-ghcr-pull
+```
+
+### 4. ตรวจ diff แล้ว apply
+
+ก่อน apply production ให้ดู diff ก่อน โดยเฉพาะ `Service` port และ `NetworkPolicy`:
+
+```bash
+kubectl diff -f k8s/deployment.yaml
+kubectl apply -f k8s/deployment.yaml
+```
+
+ตาม rollout:
+
+```bash
+kubectl -n production rollout status deploy/orc-service
+kubectl -n production get pods -l app=orc-service -o wide
+```
+
+ถ้า rollout ติด ให้ดู event ของ pod ใหม่:
+
+```bash
+kubectl -n production describe pod <pod-name>
+```
+
+สัญญาณที่พบบ่อย:
+
+| Error | ความหมาย | วิธีแก้ |
+| ----- | -------- | ------- |
+| `not found` ตอน pull image | tag หรือ repository ผิด / image ยังไม่ได้ push | เช็ค image tag ใน manifest และ GHCR |
+| `403 Forbidden` ตอน pull image | pull secret ไม่มีสิทธิ์อ่าน package | สร้าง `orc-service-ghcr-pull` ใหม่ด้วย PAT ที่มี `read:packages` และ org access |
+| `Insufficient cpu` / `Insufficient memory` | cluster schedule pod ใหม่ไม่ได้ทันที | รอ autoscaler หรือเพิ่ม capacity / ลด requests อย่างระวัง |
+| probe fail ที่ `/health` | container start แล้วแต่ app ยังไม่ ready | ดู logs และปรับ startup/readiness probe เฉพาะเมื่อ app ใช้เวลาบูตจริง |
+
+หลัง rollout ผ่าน ทดสอบ health ผ่าน service:
+
+```bash
+kubectl -n production run orc-healthcheck --rm -it --restart=Never \
+  --image=curlimages/curl -- \
+  curl -fsS http://orc-service:8899/health
+```
+
+---
+
 ## Privacy / PDPA
 
 - **In-memory only** — ไม่เคย save image ลง disk, ไม่ cache OCR result
