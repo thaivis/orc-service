@@ -50,6 +50,12 @@ ENV FLAGS_use_mkldnn=1
 # requests (106s -> 53s on the same image) with byte-identical output — same model, same math,
 # just no thread thrashing. Bump this if the CPU limit elsewhere is ever raised past 2.
 ENV PADDLE_PDX_CPU_NUM_THREADS=2
+# fastmrz/pytesseract shell out to the `tesseract` binary, which ignores OMP_NUM_THREADS and
+# spawns its own OpenMP thread pool sized to the node's real core count (measured: 4 threads on
+# a 4-vCPU node, confirmed via a bare `tesseract` invocation vs `OMP_THREAD_LIMIT`), oversubscribing
+# past the same CPU limit as above. OMP_THREAD_LIMIT is the var tesseract's OpenMP runtime actually
+# honors — confirmed it drops the subprocess to 1 thread. Keep in sync with PADDLE_PDX_CPU_NUM_THREADS.
+ENV OMP_THREAD_LIMIT=2
 
 COPY app/ ./app/
 

@@ -1,7 +1,9 @@
 import logging
+import os
 import time
 import uuid
 
+import cv2
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
@@ -18,6 +20,11 @@ from app.schemas import (
 
 configure_logging(get_settings().log_level)
 logger = logging.getLogger("orc-service")
+
+# OpenCV's parallel_for_ defaults to the node's real online CPU count (sysconf(_SC_NPROCESSORS_ONLN)),
+# ignoring cgroup CPU quota and the OMP/OPENBLAS/MKL_NUM_THREADS env vars below — on a node with more
+# cores than our CPU limit, this oversubscribes past the limit and gets CFS-throttled.
+cv2.setNumThreads(int(os.environ.get("PADDLE_PDX_CPU_NUM_THREADS", "2")))
 
 app = FastAPI(title="orc-service", version="0.1.0")
 
