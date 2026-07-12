@@ -141,6 +141,7 @@ class OcrLine:
 
 _stages: tuple | None = None
 _REC_BATCH = 6
+_TESSERACT_FIRST_PASS_CONFIGS = ((1, 11), (2, 11), (2, 6), (1, 6))
 
 
 def _get_stages():
@@ -252,7 +253,7 @@ def _run_ocr(img: np.ndarray) -> list[OcrLine]:
     return lines
 
 
-def _run_tesseract_ocr(img: np.ndarray) -> list[OcrLine]:
+def _run_tesseract_ocr(img: np.ndarray, scale: int = 1, psm: int = 11) -> list[OcrLine]:
     """English-oriented fallback for low-res Thai IDs whose Latin fields are clearer than Thai.
 
     Paddle's Thai mobile recognizer can collapse small, compressed mixed Thai/English ID cards
@@ -263,16 +264,19 @@ def _run_tesseract_ocr(img: np.ndarray) -> list[OcrLine]:
     import cv2
     import pytesseract
 
-    scaled = cv2.resize(
-        img,
-        (img.shape[1] * 2, img.shape[0] * 2),
-        interpolation=cv2.INTER_CUBIC,
+    scaled = (
+        cv2.resize(
+            img,
+            (img.shape[1] * scale, img.shape[0] * scale),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        if scale != 1 else img
     )
     gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
     data = pytesseract.image_to_data(
         gray,
         lang="eng",
-        config="--psm 6",
+        config=f"--psm {psm}",
         output_type=pytesseract.Output.DICT,
     )
 
@@ -298,10 +302,10 @@ def _run_tesseract_ocr(img: np.ndarray) -> list[OcrLine]:
         idxs = grouped[key]
         text = " ".join(data["text"][i].strip() for i in idxs)
         confs = [float(data["conf"][i]) / 100.0 for i in idxs if float(data["conf"][i]) > 0]
-        left = min(float(data["left"][i]) for i in idxs) / 2.0
-        top = min(float(data["top"][i]) for i in idxs) / 2.0
-        right = max(float(data["left"][i] + data["width"][i]) for i in idxs) / 2.0
-        bottom = max(float(data["top"][i] + data["height"][i]) for i in idxs) / 2.0
+        left = min(float(data["left"][i]) for i in idxs) / scale
+        top = min(float(data["top"][i]) for i in idxs) / scale
+        right = max(float(data["left"][i] + data["width"][i]) for i in idxs) / scale
+        bottom = max(float(data["top"][i] + data["height"][i]) for i in idxs) / scale
         lines.append(OcrLine(
             text=text,
             confidence=sum(confs) / len(confs) if confs else 0.0,
@@ -810,13 +814,14 @@ def scan_thai_id(image_bytes: bytes) -> tuple[ScanResponse | None, ScanError | N
     # Cheap first pass: many Thai IDs expose the API fields in Latin text. If Tesseract reads a
     # complete, checksum-valid card, skip Paddle entirely (and avoid model cold-start cost).
     for _deg, rotated in rotations(img):
-        lines = _run_tesseract_ocr(rotated)
-        response, _error = scan_thai_id_from_lines(lines)
-        if response is None:
-            continue
-        responses.append(response)
-        if _is_complete(response):
-            return response, None
+        for scale, psm in _TESSERACT_FIRST_PASS_CONFIGS:
+            lines = _run_tesseract_ocr(rotated, scale=scale, psm=psm)
+            response, _error = scan_thai_id_from_lines(lines)
+            if response is None:
+                continue
+            responses.append(response)
+            if _is_complete(response):
+                return response, None
 
     # Try the cardinal orientations — a card photographed upside-down or sideways otherwise OCRs
     # as noise. A cheap detection pass (~1-4s, against ~17s for a full OCR pass) splits them into

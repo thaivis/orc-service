@@ -305,7 +305,7 @@ def test_scan_thai_id_recovers_via_rotation(monkeypatch):
         thai_id_module, "_run_ocr",
         lambda rotated: good_lines if rotated == "r180" else [],
     )
-    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated: [])
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated, **kwargs: [])
 
     result, err = scan_thai_id(b"fake-bytes")
     assert err is None
@@ -336,7 +336,7 @@ def test_scan_thai_id_short_circuits_on_first_complete_rotation(monkeypatch):
         calls.append(rotated)
         return good_lines
 
-    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated: [])
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated, **kwargs: [])
     monkeypatch.setattr(thai_id_module, "_run_ocr", fake_run_ocr)
 
     result, err = scan_thai_id(b"fake-bytes")
@@ -349,7 +349,7 @@ def test_scan_thai_id_returns_no_document_when_all_rotations_fail(monkeypatch):
     monkeypatch.setattr(thai_id_module, "preprocess", lambda image_bytes: "preprocessed")
     monkeypatch.setattr(thai_id_module, "rotations", lambda img: [(0, "r0"), (180, "r180")])
     monkeypatch.setattr(thai_id_module, "_run_ocr", lambda rotated: [])
-    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated: [])
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated, **kwargs: [])
 
     result, err = scan_thai_id(b"fake-bytes")
     assert result is None
@@ -384,7 +384,7 @@ def test_scan_thai_id_merges_fields_across_rotations(monkeypatch):
         thai_id_module, "_run_ocr",
         lambda rotated: {"r0": r0_lines, "r90": r90_lines}.get(rotated, []),
     )
-    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated: [])
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated, **kwargs: [])
 
     result, err = scan_thai_id(b"fake-bytes")
     assert err is None
@@ -423,7 +423,7 @@ def test_scan_thai_id_prefers_id_number_multiple_rotations_agree_on(monkeypatch)
         thai_id_module, "_run_ocr",
         lambda rotated: lines_by_rotation.get(rotated, []),
     )
-    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated: [])
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated, **kwargs: [])
 
     result, err = scan_thai_id(b"fake-bytes")
     assert err is None
@@ -456,7 +456,7 @@ def test_scan_thai_id_tries_fallback_when_preferred_reads_only_bare_id(monkeypat
         "_run_ocr",
         lambda rotated: {"r0": preferred_lines, "r90": fallback_lines}.get(rotated, []),
     )
-    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated: [])
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", lambda rotated, **kwargs: [])
 
     result, err = scan_thai_id(b"fake-bytes")
 
@@ -482,8 +482,8 @@ def test_scan_thai_id_uses_tesseract_when_paddle_reads_no_supported_fields(monke
     monkeypatch.setattr(thai_id_module, "_rotation_plan", lambda img: ([(0, "r0")], [(90, "r90")]))
     monkeypatch.setattr(thai_id_module, "_run_ocr", lambda rotated: [])
 
-    def fake_tesseract(rotated):
-        calls.append(rotated)
+    def fake_tesseract(rotated, **kwargs):
+        calls.append((rotated, kwargs["scale"], kwargs["psm"]))
         return tesseract_lines if rotated == "r0" else []
 
     monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", fake_tesseract)
@@ -492,8 +492,47 @@ def test_scan_thai_id_uses_tesseract_when_paddle_reads_no_supported_fields(monke
 
     assert err is None
     assert result is not None
-    assert calls == ["r0"]
+    assert calls == [("r0", 1, 11)]
     assert result.document_number == valid
     assert result.first_name == "SOMCHAI"
     assert result.last_name == "JAIDEE"
     assert result.date_of_birth == date(1990, 5, 2)
+
+
+def test_scan_thai_id_tries_next_tesseract_config_before_paddle(monkeypatch):
+    """Some cards read correctly only at a different Tesseract scale/PSM. Try the next
+    Tesseract config before paying for Paddle's heavier model path."""
+    valid = _valid_id()
+    complete_lines = [
+        OcrLine(text=valid, confidence=0.95),
+        OcrLine(text="Name Mr. SOMCHAI", confidence=0.95),
+        OcrLine(text="Last name JAIDEE", confidence=0.94),
+        OcrLine(text="Date of Birth 2May 1990", confidence=0.93),
+    ]
+    tess_calls: list[tuple[str, int, int]] = []
+    paddle_calls: list[str] = []
+
+    monkeypatch.setattr(thai_id_module, "preprocess", lambda image_bytes: "preprocessed")
+    monkeypatch.setattr(thai_id_module, "rotations", lambda img: [(0, "r0")])
+    monkeypatch.setattr(thai_id_module, "_rotation_plan", lambda img: ([(0, "r0")], []))
+
+    def fake_tesseract(rotated, **kwargs):
+        tess_calls.append((rotated, kwargs["scale"], kwargs["psm"]))
+        if kwargs == {"scale": 2, "psm": 11}:
+            return complete_lines
+        return []
+
+    def fake_run_ocr(rotated):
+        paddle_calls.append(rotated)
+        return []
+
+    monkeypatch.setattr(thai_id_module, "_run_tesseract_ocr", fake_tesseract)
+    monkeypatch.setattr(thai_id_module, "_run_ocr", fake_run_ocr)
+
+    result, err = scan_thai_id(b"fake-bytes")
+
+    assert err is None
+    assert result is not None
+    assert result.document_number == valid
+    assert tess_calls == [("r0", 1, 11), ("r0", 2, 11)]
+    assert paddle_calls == []

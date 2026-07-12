@@ -14,4 +14,3 @@ venv/
 .test-fixtures/
 .claude/
 test/
-demo-web/

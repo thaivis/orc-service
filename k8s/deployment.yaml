@@ -44,7 +44,7 @@ spec:
         - name: orc-service-ghcr-pull
       containers:
         - name: orc-service
-          image: ghcr.io/thaivis/orc-service:sha-612f136
+          image: ghcr.io/thaivis/orc-service:sha-b12c54f
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
