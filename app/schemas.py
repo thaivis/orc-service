@@ -32,6 +32,8 @@ class ScanResponse(BaseModel):
     last_name: str | None = None
     document_number: str | None = None
     date_of_birth: date | None = None
+    # Passport only, and only when its MRZ check digit holds (see MrzParsed.date_of_expiry_iso).
+    date_of_expiry: date | None = None
     sex: Sex | None = None
     country: str | None = None
     document_valid: bool = False

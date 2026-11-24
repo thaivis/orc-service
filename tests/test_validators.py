@@ -4,6 +4,7 @@ from app.validators import (
     mrz_check_digit,
     mrz_check_digit_matches,
     mrz_dob_to_iso,
+    mrz_expiry_to_iso,
     thai_id_checksum,
 )
 
@@ -68,3 +69,16 @@ def test_mrz_dob_to_iso_future_date_rejected():
     today = date.today()
     if today < date(2026, 6, 1):
         assert mrz_dob_to_iso("260601") is None
+
+
+def test_mrz_expiry_to_iso_reads_20yy():
+    assert mrz_expiry_to_iso("341231") == "2034-12-31"
+
+
+def test_mrz_expiry_to_iso_keeps_past_dates():
+    assert mrz_expiry_to_iso("120415") == "2012-04-15"
+
+
+def test_mrz_expiry_to_iso_rejects_garbage():
+    assert mrz_expiry_to_iso("12AB15") is None
+    assert mrz_expiry_to_iso("121345") is None

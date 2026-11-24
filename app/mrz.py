@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from app.validators import mrz_check_digit_matches, mrz_dob_to_iso
+from app.validators import mrz_check_digit_matches, mrz_dob_to_iso, mrz_expiry_to_iso
 
 
 @dataclass
@@ -12,6 +12,9 @@ class MrzParsed:
     date_of_birth_iso: str | None
     sex: str | None
     valid: bool
+    # Only set when the expiry's own check digit holds: the app uses it, with the document number
+    # and date of birth, as the key that opens the passport chip, so a misread must not get through.
+    date_of_expiry_iso: str | None = None
 
 
 def _parse_name(name_field: str) -> tuple[str | None, str | None]:
@@ -79,6 +82,7 @@ def parse_td3(line1: str, line2: str) -> MrzParsed | None:
     nationality = line2[10:13].replace("<", "").strip() or None
     dob_field = line2[13:19]
     sex_char = line2[20]
+    expiry_field = line2[21:27]
 
     doc_ok, dob_ok, expiry_ok, personal_ok, composite_ok = td3_line2_checks(line2)
 
@@ -92,4 +96,5 @@ def parse_td3(line1: str, line2: str) -> MrzParsed | None:
         date_of_birth_iso=mrz_dob_to_iso(dob_field),
         sex=_sex_from_mrz(sex_char),
         valid=all([doc_ok, dob_ok, expiry_ok, personal_ok, composite_ok]),
+        date_of_expiry_iso=mrz_expiry_to_iso(expiry_field) if expiry_ok else None,
     )
