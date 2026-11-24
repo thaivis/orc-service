@@ -41,6 +41,22 @@ def mrz_dob_to_iso(yymmdd: str) -> str | None:
     return d.isoformat()
 
 
+def mrz_expiry_to_iso(yymmdd: str) -> str | None:
+    """Convert an MRZ expiry YYMMDD to ISO 8601. Passports run at most ~10 years, so the year is
+    20YY unless that lands implausibly far ahead (then 19YY). Past dates are kept: an expired
+    passport still has a readable chip and staff are warned about it elsewhere."""
+    if len(yymmdd) != 6 or not yymmdd.isdigit():
+        return None
+    yy, mm, dd = int(yymmdd[0:2]), int(yymmdd[2:4]), int(yymmdd[4:6])
+    year = 2000 + yy
+    if year > date.today().year + 20:
+        year -= 100
+    try:
+        return date(year, mm, dd).isoformat()
+    except ValueError:
+        return None
+
+
 def thai_id_checksum(id_str: str) -> bool:
     """Verify Thai national ID 13-digit mod-11 checksum."""
     if len(id_str) != 13 or not id_str.isdigit():

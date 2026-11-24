@@ -168,3 +168,16 @@ def test_realign_line2_stays_single_pass_on_multi_character_drift():
     raw_ocr_line2 = "".join(chars)
 
     assert _realign_line2(raw_ocr_line2) != LINE2
+
+
+def test_parse_td3_extracts_expiry_when_check_digit_holds():
+    p = parse_td3(LINE1, LINE2)
+    assert p is not None
+    assert p.date_of_expiry_iso == "2012-04-15"
+
+
+def test_parse_td3_drops_expiry_when_its_check_digit_fails():
+    bad = LINE2[:27] + "0" + LINE2[28:]  # expiry check digit 9 -> 0
+    p = parse_td3(LINE1, bad)
+    assert p is not None
+    assert p.date_of_expiry_iso is None

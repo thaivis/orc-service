@@ -180,6 +180,7 @@ def _to_response(
         last_name=parsed.surname,
         document_number=parsed.document_number,
         date_of_birth=parsed.date_of_birth_iso,
+        date_of_expiry=parsed.date_of_expiry_iso,
         sex=sex,
         country=parsed.nationality,
         document_valid=parsed.valid,

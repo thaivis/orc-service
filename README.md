@@ -78,6 +78,7 @@ interface ScanResult {
   last_name: string | null;
   document_number: string | null;
   date_of_birth: string | null;
+  date_of_expiry?: string | null; // passport only, set only when its MRZ check digit holds
   sex: 'M' | 'F' | null;
   country: string | null;
   document_valid: boolean;
